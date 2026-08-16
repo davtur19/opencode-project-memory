@@ -79,3 +79,7 @@ The file `test/claim-race.ts` requires three arguments. Exactly one contender mu
 ## License
 
 This project is licensed under the GNU Affero General Public License version 3. See the file LICENSE.
+
+## Disclaimer
+
+This code was generated with the assistance of AI.
