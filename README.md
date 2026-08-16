@@ -29,7 +29,7 @@ Compatibility is claimed only for the OpenCode versions this plugin was tested w
 
 The plugin provides these tools:
 
-- `project_preflight`: Check whether a task is already covered. It returns a context packet.; reclaim_ticket explicitly reclaims an orphaned IN_PROGRESS ticket (primary agents only)
+- `project_preflight`: Check whether a task is already covered. It returns a context packet.; reclaim_ticket + reclaim_owner explicitly reclaims an orphaned IN_PROGRESS ticket (primary agents only, owner from the IN_PROGRESS result)
 - `project_goal_checkpoint`: Write the project goal state file.
 - `project_failure_append`: Append a failure to the failures file.
 - `project_record`: Record the result of a delegated work item.

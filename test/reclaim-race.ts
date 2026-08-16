@@ -1,19 +1,22 @@
 // reclaim-race.ts — multi-process R3: exactly one concurrent reclaim wins.
-// Worker mode: argv = [bun, script, dbPath, ticket, who, task]
-// Runner mode: no args → spawns N workers against a shared DB and asserts a single winner.
+// Worker mode: argv = [bun, script, dbPath, ticket, who, task, owner]
+// Runner mode: no args → spawns N workers against a shared DB, asserts a single
+// winner, then runs a SECOND round (successive reclaim: new workers observing
+// the round-1 winner as owner) and asserts the owner chain orphan → W1 → W2.
 import * as PM from "../lib/project-memory-lib"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 
-if (process.argv.length >= 6) {
+if (process.argv.length >= 7) {
   const dbPath = process.argv[2]
   const ticket = process.argv[3]
   const who = process.argv[4]
   const task = process.argv[5]
+  const owner = process.argv[6]
   const db = PM.openMemory(dbPath)
   PM.ftsAvailable(db)
-  const r = PM.preflight(db, { task, claim: true, ownerSession: who, projectDir: "/tmp", fts: false, reclaimTicket: ticket })
+  const r = PM.preflight(db, { task, claim: true, ownerSession: who, projectDir: "/tmp", fts: false, reclaimTicket: ticket, reclaimOwner: owner })
   console.log(JSON.stringify({ who, status: r.status, ticket: r.ticket, owner: r.owner_session, reclaim_error: (r as any).reclaim_error }))
   process.exit(0)
 }
@@ -32,9 +35,9 @@ const ticket = c.ok ? c.item.id : c.inProgress.id
 db.close()
 
 const N = 8
-const runWorker = (i: number) => new Promise<any>(async (resolve, reject) => {
+const runWorker = (i: number, who: string, owner: string) => new Promise<any>(async (resolve, reject) => {
   try {
-    const proc = Bun.spawn([process.execPath, path.join(import.meta.dir, "reclaim-race.ts"), dbPath, ticket, "ses_race_" + i, "disable VOX25 DHCP"], { stdout: "pipe" })
+    const proc = Bun.spawn([process.execPath, path.join(import.meta.dir, "reclaim-race.ts"), dbPath, ticket, who, "disable VOX25 DHCP", owner], { stdout: "pipe" })
     const out = await new Response(proc.stdout).text()
     resolve(JSON.parse(out.trim()))
   } catch (e) {
@@ -42,17 +45,24 @@ const runWorker = (i: number) => new Promise<any>(async (resolve, reject) => {
   }
 })
 
-const results = await Promise.all(Array.from({ length: N }, (_, i) => runWorker(i)))
+// Round 1: 8 workers, all observing the original orphan owner
+const results = await Promise.all(Array.from({ length: N }, (_, i) => runWorker(i, "ses_race_" + i, "ses_orphan")))
 const winners = results.filter((r) => r.status === "NEW" && r.ticket === ticket)
 check("race exactly one winner", winners.length === 1, JSON.stringify(results))
 const winner = winners[0]
+
+// Round 2: successive reclaim — 8 NEW workers observing the round-1 winner as owner
+const results2 = await Promise.all(Array.from({ length: N }, (_, i) => runWorker(i, "ses_race2_" + i, winner.who)))
+const winners2 = results2.filter((r) => r.status === "NEW" && r.ticket === ticket)
+check("race round 2 exactly one winner", winners2.length === 1, JSON.stringify(results2))
+const winner2 = winners2[0]
 
 const db2 = PM.openMemory(dbPath)
 const n = (db2.query("SELECT COUNT(*) AS n FROM work_items WHERE canonical_key='disable vox25 dhcp'").get() as { n: number }).n
 check("race count 1", n === 1, String(n))
 const row = db2.query("SELECT * FROM work_items WHERE id=?").get(ticket) as any
 check("race row in_progress", row.status === "in_progress", JSON.stringify(row))
-check("race owner = winner", row.owner_session === winner.who, JSON.stringify(row))
+check("race owner chain orphan→W1→W2", row.owner_session === winner2.who, JSON.stringify(row))
 db2.close()
 
 console.log(`\nRESULT: ${pass} pass, ${fail} fail`)

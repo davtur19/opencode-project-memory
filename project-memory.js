@@ -377,32 +377,33 @@ function reclaimWorkItem(db, opts) {
     return { ok: false, reason: `ticket not found: ${opts.ticket}` };
   if (item.status !== "in_progress")
     return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${item.status})` };
-  if (item.reclaimed_at)
-    return { ok: false, reason: `ticket ${opts.ticket} was already reclaimed at ${item.reclaimed_at}` };
   const key = normalizeKey(opts.task);
   const overlap = tokenOverlap(key, `${item.canonical_key} ${item.summary} ${item.unresolved}`);
   if (key !== item.canonical_key && overlap < MIN_SEMANTIC_OVERLAP) {
     return { ok: false, reason: `reclaim denied: requested work does not correspond to ticket ${opts.ticket} (canonical_key=${item.canonical_key}, overlap=${overlap})` };
   }
   const now = nowIso();
-  const prevOwner = item.owner_session;
-  const historyNote = `[reclaim] ${now} by ${opts.ownerSession} from ${prevOwner ?? "none"}`;
+  const historyNote = `[reclaim] ${now} from ${item.owner_session ?? "none"} to ${opts.ownerSession}`;
   const notes = [item.notes, historyNote].filter(Boolean).join(`
 `);
-  const res = db.run("UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=? WHERE id=? AND status='in_progress' AND reclaimed_at IS NULL", [opts.ownerSession, notes, now, now, opts.ticket]);
+  const res = db.run("UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=? WHERE id=? AND status='in_progress' AND owner_session=?", [opts.ownerSession, notes, now, now, opts.ticket, opts.previousOwner]);
   if (res.changes === 0) {
     const cur = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
     if (!cur)
       return { ok: false, reason: `ticket not found: ${opts.ticket}` };
     if (cur.status !== "in_progress")
       return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${cur.status})` };
-    return { ok: false, reason: `reclaim lost: ticket ${opts.ticket} was already reclaimed by ${cur.owner_session ?? "?"} at ${cur.reclaimed_at ?? "?"}` };
+    return { ok: false, reason: `reclaim lost: current owner of ${opts.ticket} is ${cur.owner_session ?? "none"} (expected ${opts.previousOwner}); re-preflight to observe the current owner and retry` };
   }
-  return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket), previous_owner: prevOwner, reclaimed_at: now };
+  return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket), previous_owner: opts.previousOwner, reclaimed_at: now };
 }
 function preflight(db, opts) {
   if (opts.reclaimTicket) {
-    const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, task: opts.task, ownerSession: opts.ownerSession });
+    if (!opts.reclaimOwner) {
+      const res2 = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts });
+      return { ...res2, reclaim_error: "reclaim_owner is required: pass the owner_session observed in the IN_PROGRESS preflight result" };
+    }
+    const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, task: opts.task, ownerSession: opts.ownerSession, previousOwner: opts.reclaimOwner });
     if (r.ok) {
       const key = normalizeKey(opts.task);
       const readFirst = readFirstFor(db, key, opts.fts);
@@ -849,7 +850,8 @@ var project_memory_default = {
           args: {
             task: tool.schema.string().describe("Work to check in project memory"),
             claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
-            reclaim_ticket: tool.schema.string().optional().describe("Explicitly reclaim this orphaned IN_PROGRESS ticket")
+            reclaim_ticket: tool.schema.string().optional().describe("Explicitly reclaim this orphaned IN_PROGRESS ticket"),
+            reclaim_owner: tool.schema.string().optional().describe("Expected current owner of the reclaim target (owner_session from the IN_PROGRESS preflight result); required with reclaim_ticket")
           },
           execute: async (args, tctx) => {
             if (!handle)
@@ -859,10 +861,13 @@ var project_memory_default = {
             if (args.reclaim_ticket && !isPrimary(agent)) {
               return JSON.stringify({ status: "ERROR", error: "reclaim requires a primary agent (" + PRIMARY_AGENTS.join(", ") + "); subagents may not reclaim claims" });
             }
+            if (args.reclaim_ticket && !args.reclaim_owner) {
+              return JSON.stringify({ status: "ERROR", error: "reclaim_owner is required with reclaim_ticket (pass the owner_session from the IN_PROGRESS preflight result)" });
+            }
             if (claim && !isPrimary(agent)) {
               return JSON.stringify({ status: "ERROR", error: `claim requires a primary agent (${PRIMARY_AGENTS.join(", ")}); subagents may query with claim=false` });
             }
-            const { handle: h, result } = preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts, reclaimTicket: args.reclaim_ticket });
+            const { handle: h, result } = preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts, reclaimTicket: args.reclaim_ticket, reclaimOwner: args.reclaim_owner });
             handle = h;
             return JSON.stringify(result, null, 2);
           }

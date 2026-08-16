@@ -32,16 +32,18 @@ export default {
             task: tool.schema.string().describe("Work to check in project memory"),
             claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
             reclaim_ticket: tool.schema.string().optional().describe("Explicitly reclaim this orphaned IN_PROGRESS ticket"),
+            reclaim_owner: tool.schema.string().optional().describe("Expected current owner of the reclaim target (owner_session from the IN_PROGRESS preflight result); required with reclaim_ticket"),
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ status: "MEMORY_ERROR", canonical_key: PM.normalizeKey(args.task), error: { message: "project memory unavailable", cause: "init failed" } }, null, 2)
             const agent = tctx.agent ?? ""
             const claim = args.claim !== false
             if (args.reclaim_ticket && !isPrimary(agent)) { return JSON.stringify({ status: "ERROR", error: "reclaim requires a primary agent (" + PRIMARY_AGENTS.join(", ") + "); subagents may not reclaim claims" }) }
+            if (args.reclaim_ticket && !args.reclaim_owner) { return JSON.stringify({ status: "ERROR", error: "reclaim_owner is required with reclaim_ticket (pass the owner_session from the IN_PROGRESS preflight result)" }) }
             if (claim && !isPrimary(agent)) {
               return JSON.stringify({ status: "ERROR", error: `claim requires a primary agent (${PRIMARY_AGENTS.join(", ")}); subagents may query with claim=false` })
             }
-            const { handle: h, result } = PM.preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts, reclaimTicket: args.reclaim_ticket })
+            const { handle: h, result } = PM.preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts, reclaimTicket: args.reclaim_ticket, reclaimOwner: args.reclaim_owner })
             handle = h
             return JSON.stringify(result, null, 2)
           },

@@ -279,34 +279,38 @@ export type ReclaimResult =
   | { ok: false; reason: string }
 
 // Explicit reclaim of an orphaned/abandoned IN_PROGRESS claim.
-// The guarded UPDATE is a single atomic statement: concurrent reclaim attempts
-// serialize on the SQLite write lock and exactly one wins (the first sets
-// reclaimed_at; the rest match 0 rows and report the loss).
-export function reclaimWorkItem(db: Database, opts: { ticket: string; task: string; ownerSession: string }): ReclaimResult {
+// The atomic UPDATE is a compare-and-swap on the OBSERVED owner: the caller
+// passes the owner_session it saw in the IN_PROGRESS preflight result, and the
+// guarded UPDATE (WHERE owner_session=?) succeeds only while the claim is still
+// held by that owner. Concurrent reclaimers that observed the same owner
+// serialize on the SQLite write lock and exactly one wins (1/N); the losers
+// match 0 rows and report the stale owner. Because the CAS is on the owner (not
+// on reclaimed_at), SUCCESSIVE reclaims of repeated orphans are allowed: orphan
+// → reclaim → new orphan → reclaim again works. reclaimed_at is pure audit
+// (timestamp of the last reclaim), never a gate.
+export function reclaimWorkItem(db: Database, opts: { ticket: string; task: string; ownerSession: string; previousOwner: string }): ReclaimResult {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
   if (!item) return { ok: false, reason: `ticket not found: ${opts.ticket}` }
   if (item.status !== "in_progress") return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${item.status})` }
-  if (item.reclaimed_at) return { ok: false, reason: `ticket ${opts.ticket} was already reclaimed at ${item.reclaimed_at}` }
   const key = normalizeKey(opts.task)
   const overlap = tokenOverlap(key, `${item.canonical_key} ${item.summary} ${item.unresolved}`)
   if (key !== item.canonical_key && overlap < MIN_SEMANTIC_OVERLAP) {
     return { ok: false, reason: `reclaim denied: requested work does not correspond to ticket ${opts.ticket} (canonical_key=${item.canonical_key}, overlap=${overlap})` }
   }
   const now = nowIso()
-  const prevOwner = item.owner_session
-  const historyNote = `[reclaim] ${now} by ${opts.ownerSession} from ${prevOwner ?? "none"}`
+  const historyNote = `[reclaim] ${now} from ${item.owner_session ?? "none"} to ${opts.ownerSession}`
   const notes = [item.notes, historyNote].filter(Boolean).join("\n")
   const res = db.run(
-    "UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=? WHERE id=? AND status='in_progress' AND reclaimed_at IS NULL",
-    [opts.ownerSession, notes, now, now, opts.ticket],
+    "UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=? WHERE id=? AND status='in_progress' AND owner_session=?",
+    [opts.ownerSession, notes, now, now, opts.ticket, opts.previousOwner],
   )
   if (res.changes === 0) {
     const cur = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
     if (!cur) return { ok: false, reason: `ticket not found: ${opts.ticket}` }
     if (cur.status !== "in_progress") return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${cur.status})` }
-    return { ok: false, reason: `reclaim lost: ticket ${opts.ticket} was already reclaimed by ${cur.owner_session ?? "?"} at ${cur.reclaimed_at ?? "?"}` }
+    return { ok: false, reason: `reclaim lost: current owner of ${opts.ticket} is ${cur.owner_session ?? "none"} (expected ${opts.previousOwner}); re-preflight to observe the current owner and retry` }
   }
-  return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem, previous_owner: prevOwner, reclaimed_at: now }
+  return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem, previous_owner: opts.previousOwner, reclaimed_at: now }
 }
 
 // ---------- preflight ----------
@@ -334,9 +338,13 @@ export type PreflightResult = {
   candidates: { key: string; status: string; id: string }[]
 }
 
-export function preflight(db: Database, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean; reclaimTicket?: string }): PreflightResult {
+export function preflight(db: Database, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean; reclaimTicket?: string; reclaimOwner?: string }): PreflightResult {
   if (opts.reclaimTicket) {
-    const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, task: opts.task, ownerSession: opts.ownerSession })
+    if (!opts.reclaimOwner) {
+      const res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts })
+      return { ...res, reclaim_error: "reclaim_owner is required: pass the owner_session observed in the IN_PROGRESS preflight result" }
+    }
+    const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, task: opts.task, ownerSession: opts.ownerSession, previousOwner: opts.reclaimOwner })
     if (r.ok) {
       const key = normalizeKey(opts.task)
       const readFirst = readFirstFor(db, key, opts.fts)
@@ -718,7 +726,7 @@ export type MemoryErrorResult = {
   error: { message: string; cause: string }
 }
 
-export function preflightSafe(handle: MemoryHandle, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean; reclaimTicket?: string }): { handle: MemoryHandle; result: PreflightResult | MemoryErrorResult } {
+export function preflightSafe(handle: MemoryHandle, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean; reclaimTicket?: string; reclaimOwner?: string }): { handle: MemoryHandle; result: PreflightResult | MemoryErrorResult } {
   const key = normalizeKey(opts.task)
   try {
     const { handle: h, value } = runWithRecovery(handle, (db) => preflight(db, opts))
