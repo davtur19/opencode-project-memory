@@ -2,6 +2,9 @@
 // Scenario: a DHCP-token hypothesis (idea-a) blocked on an unsatisfied condition,
 // made actionable by a validated bench test (idea-b), a disproven tunnel idea
 // (idea-c), a dependent idea (idea-d) and an unrelated idea (idea-z).
+// Hardened rules exercised: relation targets must already exist (no placeholders),
+// validated/disproven require evidence, satisfies works only from a validated idea
+// with evidence and records the idea id as provenance.
 // Keys are normalized: input "idea-a" is stored/returned as canonical "idea a".
 import * as PM from "../lib/project-memory-lib"
 import * as PM2 from "../lib/project-memory-v2"
@@ -19,9 +22,18 @@ const db = PM.openMemory(path.join(dir, "memory.sqlite"))
 const fts = PM.ftsAvailable(db)
 PM2.ensureV2Schema(db, fts)
 
-// 1. idea-a blocked on an open condition
+// 0. the open condition must be created explicitly (missing targets are never
+//    auto-created into placeholders)
 {
   const r = PM2.ideaRecord(db, { idea: { key: "idea-a", title: "unlock admin via DHCP trick", summary: "inject a token through the DHCP option to reach the admin shell" }, relations: [{ idea: "idea-a", kind: "requires", target: "condition:dhcp-token-verified" }] })
+  check("0 missing condition target → ok:false", r.ok === false && /target not found/.test(r.error ?? ""), JSON.stringify(r))
+  const r2 = PM2.ideaRecord(db, { idea: { key: "idea-a", title: "unlock admin via DHCP trick", summary: "inject a token through the DHCP option to reach the admin shell" }, conditions: [{ key: "dhcp-token-verified", description: "token verified on a live device" }] })
+  check("0 condition created explicitly", r2.ok === true, JSON.stringify(r2))
+}
+
+// 1. idea-a blocked on the open condition
+{
+  const r = PM2.ideaRecord(db, { idea: { key: "idea-a" }, relations: [{ idea: "idea-a", kind: "requires", target: "condition:dhcp-token-verified" }] })
   check("1 idea-a recorded", r.ok === true && r.idea?.status === "proposed" && r.relations?.length === 1, JSON.stringify(r))
 }
 
@@ -37,10 +49,12 @@ let ideaAId = ""
   ideaAId = a?.id ?? ""
 }
 
-// 3. idea-b validated, satisfies the condition (status passed at top level, per spec)
+// 3. idea-b validated (with evidence) satisfies the condition (status at top level)
 {
-  const r = PM2.ideaRecord(db, { idea: { key: "idea-b", title: "token test on bench device", summary: "bench dhcp capture" }, status: "validated", satisfies: ["dhcp-token-verified"] })
+  const r = PM2.ideaRecord(db, { idea: { key: "idea-b", title: "token test on bench device", summary: "bench dhcp capture" }, status: "validated", evidence: "bench.log: token observed in DHCP option 224", satisfies: ["dhcp-token-verified"] })
   check("3 idea-b validated + satisfies", r.ok === true && r.idea?.status === "validated", JSON.stringify(r))
+  const cond = db.query("SELECT * FROM conditions WHERE canonical_key='dhcp token verified'").get() as any
+  check("3 provenance is idea-b id", cond?.satisfied === 1 && cond?.satisfied_by === r.idea?.id, JSON.stringify(cond))
 }
 
 // 4. frontier again: idea-a SAME id, now ready, still persisted as proposed
@@ -54,9 +68,9 @@ let ideaAId = ""
   check("4 idea-a persisted status still proposed", persisted?.status === "proposed", JSON.stringify(persisted))
 }
 
-// 5. disproven idea is remembered but never actionable
+// 5. disproven idea (with evidence) is remembered but never actionable
 {
-  const r = PM2.ideaRecord(db, { idea: { key: "idea-c", title: "tunnel via FTP bounce", summary: "bounce a tunnel through the ftp proxy" }, status: "disproven" })
+  const r = PM2.ideaRecord(db, { idea: { key: "idea-c", title: "tunnel via FTP bounce", summary: "bounce a tunnel through the ftp proxy" }, status: "disproven", evidence: "three devices: ftp bounce fails with connection reset" })
   check("5 idea-c disproven recorded", r.ok === true && r.idea?.status === "disproven", JSON.stringify(r))
   const f = PM2.projectFrontier(db, { goal: "FTP bounce tunnel" })
   const c = f.ideas.find((i: any) => i.key === "idea c")

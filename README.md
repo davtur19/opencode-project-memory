@@ -1,12 +1,12 @@
 # opencode-project-memory
 
-Persistent project memory for OpenCode agents. The plugin stores state in a local SQLite database and exposes six tools.
+Persistent project memory for OpenCode agents. The plugin stores state in a local SQLite database and exposes five tools.
 
-The plugin persists and retrieves state. The LLM generates, combines and chooses ideas. There is no DAG, no scheduler, no graph database and no embeddings.
+The plugin persists and retrieves state. The LLM generates, combines and chooses ideas. There is no DAG, no scheduler, no graph database, no embeddings, no gate, and no task orchestration.
 
 ## What it stores
 
-- **V1 — work memory**: work items, findings, evidence and reusable facts. It prevents duplicate investigative work and keeps project state across sessions.
+- **V1 — work memory**: work items, findings, evidence and reusable failures. It prevents duplicate investigative work and keeps project state across sessions.
 - **V2 — idea memory**: ideas (hypotheses), prerequisites (conditions) and their relations. Ideas are separate from established facts.
 
 ## Tools
@@ -14,23 +14,28 @@ The plugin persists and retrieves state. The LLM generates, combines and chooses
 - `project_work_check`: Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress.
 - `project_work_save`: Save durable results, evidence and reusable facts learned from work.
 - `project_failure_save`: Save a reusable failure or blocker when it can prevent repeated wasted work.
-- `project_goal_update`: Update goal progress worth preserving across compaction or continuation.
 - `project_idea_search`: Search durable project ideas, prerequisites and relations relevant to exploratory work.
 - `project_idea_save`: Save or update a durable idea, prerequisite and its relations.
+
+There are no hooks, no event listeners, and no gating of other tool calls.
 
 ## Work loop (V1)
 
 1. Before investigative work, call `project_work_check(work=...)`.
 2. Do not repeat COVERED or IN_PROGRESS work. For PARTIAL work, do only the unresolved delta.
-3. Run independent work with `task(background=true)`. Steer an existing worker via its `task_id`.
-4. Save the result with `project_work_save(ticket=..., status=..., summary=..., evidence=..., facts=...)`.
-5. If `project_work_check` returns IN_PROGRESS, never retry `task()` for that work. Steer the existing worker via `task_id` when possible; reclaim only if orphaned; otherwise continue other work.
+3. Save the result with `project_work_save(ticket=..., status=..., summary=..., evidence=...)`.
+4. If `project_work_check` returns IN_PROGRESS, never retry `task()` for that work. Steer the existing worker via its `task_id` when possible; reclaim only if orphaned; otherwise continue other work.
 
 ## Idea loop (V2)
 
 1. Before generating exploratory hypotheses, call `project_idea_search(query=...)`.
 2. Preserve materially distinct useful ideas with `project_idea_save(...)`.
-3. BLOCKED is not the same as DISPROVEN. Confirmed state changes require evidence.
+3. BLOCKED is not the same as DISPROVEN. Confirmed state changes require evidence:
+   - `validated` and `disproven` require non-empty `evidence`.
+   - A condition marked `satisfied: true` requires `satisfied_by`.
+   - `satisfies` is accepted only from a `validated` idea that carries evidence; the condition's `satisfied_by` records the satisfying idea's id.
+   - Relation sources and targets must already exist — missing targets are never auto-created.
+   - A save with any validation error is atomic: `ok: false` and nothing is written.
 4. Relation kinds: `requires`, `enables`, `supports`, `contradicts`, `combines_with`, `derived_from`.
 5. Idea lifecycle: `proposed`, `testing`, `validated`, `disproven`, `dormant`.
 
@@ -43,8 +48,8 @@ The plugin persists and retrieves state. The LLM generates, combines and chooses
 ## Fail-closed behavior
 
 - A successful query with no match returns NEW.
-- A memory error returns MEMORY_ERROR. The gate blocks the investigative task.
-- The tools `vision` and `verifier` are exempt. Steering via `task_id` is exempt.
+- A memory error returns MEMORY_ERROR (`memoryUnavailable: true`) so the caller can handle it explicitly.
+- The tools `vision` and `verifier` are exempt.
 
 ## Requirements
 
@@ -52,16 +57,12 @@ The plugin persists and retrieves state. The LLM generates, combines and chooses
 - Bun runtime.
 - SQLite with FTS5 support.
 
-Background subagents are not required for memory and preflight themselves. The recommended async orchestration workflow — `task(background=true)` for independent work and `task_id` to continue or steer an existing worker — requires an OpenCode version with native background subagent support. Enable it with:
-
-OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
-
 Compatibility is claimed only for the OpenCode versions this plugin was tested with.
 
 ## Files
 
 - `project-memory.ts`: The plugin entry point.
-- `lib/project-memory-lib.ts`: The core logic. It contains the schema, the FTS5 search with LIKE fallback, the atomic claim, the preflight, the bootstrap, the gate, and the fail-closed recovery.
+- `lib/project-memory-lib.ts`: The core logic. It contains the schema, the FTS5 search with LIKE fallback, the atomic claim, the preflight, the bootstrap, and the fail-closed recovery.
 - `lib/project-memory-v2.ts`: The V2 idea memory core.
 - `test/`: The standalone tests for Bun.
 
@@ -100,6 +101,8 @@ bun test/claim-race.ts <db> <key> <who>
 bun test/test-v2.ts
 bun test/test-v2-e2e.ts
 bun test/test-v2-plugin.ts
+bun test/test-packet-compact.ts
+bun test/test-scheduler-removed.ts
 ```
 
 The file `test/claim-race.ts` requires three arguments. Exactly one contender must win the race.

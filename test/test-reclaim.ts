@@ -42,7 +42,6 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
   check("R2 count 1", count(db, "disable VOX25 DHCP") === 1)
   const rec = (r as any).reclaimed
   check("R2 reclaimed meta", rec?.previous_owner === "ses_A" && !!rec?.reclaimed_at, JSON.stringify(rec))
-  check("R2 gate allow new owner", PM.gateDecision(db, { sessionID: "ses_B", args: { subagent_type: "subagent" } }).action === "allow")
 }
 
 // R3 — concurrent reclaim attempts (single process): exactly one wins
@@ -57,14 +56,22 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
   check("R3 row in_progress", row.status === "in_progress", JSON.stringify(row))
 }
 
-// R4 — mismatched reclaim is denied
+// R4 — reclaim relies on explicit ticket + observed-owner CAS, NOT token overlap.
+// With the correct ticket and owner the reclaim succeeds even when the request
+// text differs (the caller is responsible for passing the right ticket from the
+// IN_PROGRESS preflight result). A WRONG observed owner is denied by the CAS.
 {
   const { db, dir, fts } = freshDb("r4")
   const tA = claim(db, "disable VOX25 DHCP", "ses_A")
   const r = PM.preflight(db, { task: "compile a rust program for the embedded target", claim: true, ownerSession: "ses_B", projectDir: dir, fts, reclaimTicket: tA, reclaimOwner: "ses_A" })
-  check("R4 mismatch reclaim_error", !!(r as any).reclaim_error, JSON.stringify(r))
+  check("R4 different task text still reclaims (ticket+CAS)", r.status === "NEW" && r.ticket === tA && r.owner_session === "ses_B", JSON.stringify(r))
   const row = db.query("SELECT * FROM work_items WHERE id=?").get(tA) as any
-  check("R4 row untouched", row.owner_session === "ses_A" && row.status === "in_progress", JSON.stringify(row))
+  check("R4 row reclaimed to ses_B", row.owner_session === "ses_B" && row.status === "in_progress", JSON.stringify(row))
+  // wrong owner → CAS denies
+  const rBad = PM.preflight(db, { task: "disable VOX25 DHCP", claim: true, ownerSession: "ses_C", projectDir: dir, fts, reclaimTicket: tA, reclaimOwner: "ses_phantom" })
+  check("R4 wrong owner CAS denied", !!(rBad as any).reclaim_error, JSON.stringify(rBad))
+  const row2 = db.query("SELECT * FROM work_items WHERE id=?").get(tA) as any
+  check("R4 row still ses_B after denied CAS", row2.owner_session === "ses_B", JSON.stringify(row2))
 }
 
 // R5 — reclaim of non-in_progress tickets (done/blocked/failed/covered) is denied
@@ -129,7 +136,6 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
   check("R6b B→C", notes.includes("from ses_B to ses_C"), notes)
   check("R6b C→D", notes.includes("from ses_C to ses_D"), notes)
   check("R6b reclaimed_at truthy", !!row.reclaimed_at, row.reclaimed_at)
-  check("R6b gate allows ses_D", PM.gateDecision(db, { sessionID: "ses_D", args: { subagent_type: "subagent" } }).action === "allow")
 }
 
 // R6c — successive reclaim under concurrency: after one reclaim, a fresh 8-way
@@ -201,17 +207,15 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
   dbM2.close()
 }
 
-// PHASE 10 — realistic flow: primary claims, binds child, secondary primary reclaims
+// PHASE 10 — realistic flow: primary claims, secondary primary reclaims
 {
   const { db, dir, fts } = freshDb("p10")
   const t = claim(db, "disable VOX25 DHCP", "ses_primary")
-  PM.bindClaimToChild(db, "ses_primary", "ses_worker")
   const r1 = PM.preflight(db, { task: "disable VOX25 DHCP", claim: true, ownerSession: "ses_primary", projectDir: dir, fts })
   check("P10 IN_PROGRESS same ticket", r1.status === "IN_PROGRESS" && r1.ticket === t, JSON.stringify(r1))
   const r2 = PM.preflight(db, { task: "disable VOX25 DHCP", claim: true, ownerSession: "ses_primary2", projectDir: dir, fts, reclaimTicket: t, reclaimOwner: "ses_primary" })
   check("P10 reclaim → NEW same ticket", r2.status === "NEW" && r2.ticket === t, JSON.stringify(r2))
   check("P10 owner ses_primary2", r2.owner_session === "ses_primary2", JSON.stringify(r2))
-  check("P10 gate allow", PM.gateDecision(db, { sessionID: "ses_primary2", args: { subagent_type: "subagent" } }).action === "allow")
   check("P10 count 1", count(db, "disable VOX25 DHCP") === 1)
   const row = db.query("SELECT * FROM work_items WHERE id=?").get(t) as any
   check("P10 in_progress (not blocked)", row.status === "in_progress", JSON.stringify(row))

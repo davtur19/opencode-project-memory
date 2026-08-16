@@ -5,7 +5,6 @@ import * as PM from "./lib/project-memory-lib"
 import * as PM2 from "./lib/project-memory-v2"
 
 const PRIMARY_AGENTS = (process.env.PROJECT_MEMORY_PRIMARY_AGENTS ?? "orchestrator,orchestrator-goal").split(",").map((s) => s.trim()).filter(Boolean)
-const GATE_MODE = (process.env.PROJECT_MEMORY_GATE ?? "strict") as "strict" | "warn" | "off"
 
 export default {
   id: "project-memory",
@@ -23,13 +22,12 @@ export default {
       console.error("[project-memory] init failed:", e)
       handle = null
     }
-    const warnCalls = new Set<string>()
     const isPrimary = (agent: string) => PRIMARY_AGENTS.includes(agent)
 
     return {
       tool: {
         project_work_check: tool({
-          description: "Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress.",
+          description: "Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress. Semantics: NEW = new work; PARTIAL = use established context and do unresolved work; COVERED = reuse the stored result; IN_PROGRESS = do not duplicate, reclaim only if known orphaned; MEMORY_ERROR = memory is uncertain.",
           args: {
             work: tool.schema.string().describe("Work to check in project memory"),
             claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
@@ -51,14 +49,13 @@ export default {
           },
         }),
         project_work_save: tool({
-          description: "Save durable results, evidence and reusable facts learned from work.",
+          description: "Save durable results and evidence learned from work.",
           args: {
             ticket: tool.schema.string().describe("Work item id from project_work_check"),
             status: tool.schema.enum(["done", "blocked", "failed"]),
             summary: tool.schema.string().optional().describe("Result summary"),
             unresolved: tool.schema.string().optional().describe("Remaining unresolved delta, if any"),
             evidence: tool.schema.array(tool.schema.string()).optional().describe("File paths / report ids produced"),
-            facts: tool.schema.array(tool.schema.object({ key: tool.schema.string(), value: tool.schema.string() })).optional().describe("Reusable facts learned"),
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
@@ -70,15 +67,6 @@ export default {
             } catch (e: any) {
               return JSON.stringify({ ok: false, error: `record failed: ${e?.message ?? e}` })
             }
-          },
-        }),
-        project_goal_update: tool({
-          description: "Update goal progress worth preserving across compaction or continuation.",
-          args: { progress: tool.schema.string().describe("Goal progress to preserve") },
-          execute: async (args: any, tctx: any) => {
-            if (!isPrimary(tctx.agent ?? "")) return JSON.stringify({ ok: false, error: "only primary agents can update goal-state" })
-            const res = PM.checkpointGoal(directory, args.progress)
-            return JSON.stringify({ ok: true, ...res })
           },
         }),
         project_failure_save: tool({
@@ -102,7 +90,7 @@ export default {
           },
         }),
         project_idea_save: tool({
-          description: "Save or update a durable idea, prerequisite and its relations.",
+          description: "Save or update a durable idea, prerequisite and its relations. validated/disproven require non-empty evidence; satisfied conditions require explicit provenance; satisfies only works from a validated idea with evidence. Invalid input is atomic: ok:false with no partial writes.",
           args: {
             idea: tool.schema.object({
               key: tool.schema.string().optional(),
@@ -123,8 +111,8 @@ export default {
               idea: tool.schema.string(),
               kind: tool.schema.enum(PM2.RELATION_KINDS as unknown as [string, ...string[]]),
               target: tool.schema.string(),
-            })).optional().describe("Relations to add"),
-            satisfies: tool.schema.array(tool.schema.string()).optional().describe("Condition keys this idea satisfies"),
+            })).optional().describe("Relations to add (targets must already exist)"),
+            satisfies: tool.schema.array(tool.schema.string()).optional().describe("Condition keys this validated idea satisfies"),
             remove_relations: tool.schema.array(tool.schema.object({
               idea: tool.schema.string(),
               kind: tool.schema.enum(PM2.RELATION_KINDS as unknown as [string, ...string[]]),
@@ -157,40 +145,6 @@ export default {
             }
           },
         }),
-      },
-      event: async ({ event }: any) => {
-        if (!handle) return
-        const p = event?.properties
-        if (!p?.sessionID) return
-        if (typeof event.type === "string" && event.type.includes("session.created")) {
-          const parentID = p.info?.parentID
-          if (parentID) {
-            try { PM.bindClaimToChild(handle.db, parentID, p.sessionID) } catch (e) { console.error("[project-memory] bindClaimToChild failed:", e) }
-          }
-        }
-      },
-      "tool.execute.before": async (input: any, output: any) => {
-        if (input.tool !== "task") return
-        if (GATE_MODE === "off") return
-        if (!handle) {
-          if (GATE_MODE === "strict") throw new Error("Project memory preflight is unavailable or inconclusive. Delegation blocked to avoid repeating or conflicting work.")
-          warnCalls.add(input.callID)
-          return
-        }
-        const { handle: h, decision } = PM.gateSafe(handle, { sessionID: input.sessionID, args: output?.args ?? {} })
-        handle = h
-        if (decision.action === "block") {
-          throw new Error(decision.reason ?? "project-memory gate: preflight required")
-        }
-        if (decision.action === "warn") {
-          warnCalls.add(input.callID)
-        }
-      },
-      "tool.execute.after": async (input: any, output: any) => {
-        if (input.tool === "task" && warnCalls.has(input.callID)) {
-          warnCalls.delete(input.callID)
-          output.output = (output.output ?? "") + "\n\n[project-memory] WARNING: task delegated without a project preflight ticket."
-        }
       },
     }
   },

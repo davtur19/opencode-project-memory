@@ -203,9 +203,6 @@ function ensureScratch(base, ticket) {
   fs.mkdirSync(p, { recursive: true });
   return p;
 }
-function stripMarkdown(s) {
-  return s.replace(/\*\*/g, "").replace(/`/g, "").trim();
-}
 function evidenceFor(db, itemId) {
   return db.query("SELECT path FROM evidence WHERE work_item_id=?").all(itemId).map((r) => r.path);
 }
@@ -216,159 +213,13 @@ function ftsQuery(key) {
   return toks.map((t) => `"${t}"`).join(" OR ");
 }
 function readFirstFor(db, key, fts) {
-  if (fts) {
+  if (!fts)
+    return [];
+  try {
     return db.query("SELECT path FROM markdown_fts WHERE markdown_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)).map((r) => r.path);
+  } catch {
+    return [];
   }
-  return db.query("SELECT path FROM markdown_fts WHERE path LIKE ? OR title LIKE ? LIMIT 6").all(`%${key}%`, `%${key}%`).map((r) => r.path);
-}
-var MIN_SEMANTIC_OVERLAP = 3;
-var STOPWORDS = new Set([
-  "a",
-  "an",
-  "and",
-  "are",
-  "as",
-  "at",
-  "be",
-  "been",
-  "by",
-  "for",
-  "from",
-  "in",
-  "into",
-  "is",
-  "it",
-  "of",
-  "on",
-  "or",
-  "that",
-  "the",
-  "to",
-  "was",
-  "were",
-  "will",
-  "with",
-  "do",
-  "does",
-  "did",
-  "have",
-  "has",
-  "had",
-  "not",
-  "but",
-  "this",
-  "these",
-  "those",
-  "its",
-  "our",
-  "your",
-  "their",
-  "we",
-  "you",
-  "they",
-  "he",
-  "she",
-  "i",
-  "me",
-  "my",
-  "him",
-  "her",
-  "us",
-  "them",
-  "then",
-  "than",
-  "so",
-  "if",
-  "while",
-  "when",
-  "where",
-  "which",
-  "who",
-  "whom",
-  "what",
-  "why",
-  "how",
-  "all",
-  "any",
-  "both",
-  "each",
-  "few",
-  "more",
-  "most",
-  "other",
-  "some",
-  "such",
-  "no",
-  "nor",
-  "only",
-  "own",
-  "same",
-  "too",
-  "very",
-  "just",
-  "also",
-  "even",
-  "di",
-  "da",
-  "e",
-  "a",
-  "il",
-  "la",
-  "le",
-  "i",
-  "gli",
-  "lo",
-  "un",
-  "una",
-  "uno",
-  "del",
-  "della",
-  "dei",
-  "delle",
-  "nel",
-  "nella",
-  "nei",
-  "nelle",
-  "con",
-  "su",
-  "per",
-  "che",
-  "chi",
-  "cui",
-  "piu",
-  "meno",
-  "non",
-  "si",
-  "se",
-  "quando",
-  "dove",
-  "come",
-  "cosa",
-  "questo",
-  "questa",
-  "questi",
-  "queste",
-  "quello",
-  "quella",
-  "quelli",
-  "quelle"
-]);
-function sigTokens(s) {
-  const out = new Set;
-  for (const t of normalizeKey(s).split(" ").filter(Boolean)) {
-    if (t.length >= 3 && !STOPWORDS.has(t))
-      out.add(t);
-  }
-  return out;
-}
-function tokenOverlap(a, b) {
-  const sa = sigTokens(a);
-  const sb = sigTokens(b);
-  let n = 0;
-  for (const t of sa)
-    if (sb.has(t))
-      n++;
-  return n;
 }
 function maybeSyncFts(db, fts) {
   if (!fts)
@@ -387,11 +238,6 @@ function reclaimWorkItem(db, opts) {
     return { ok: false, reason: `ticket not found: ${opts.ticket}` };
   if (item.status !== "in_progress")
     return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${item.status})` };
-  const key = normalizeKey(opts.task);
-  const overlap = tokenOverlap(key, `${item.canonical_key} ${item.summary} ${item.unresolved}`);
-  if (key !== item.canonical_key && overlap < MIN_SEMANTIC_OVERLAP) {
-    return { ok: false, reason: `reclaim denied: requested work does not correspond to ticket ${opts.ticket} (ref=${compactRef(item.canonical_key)}, overlap=${overlap})` };
-  }
   const now = nowIso();
   const historyNote = `[reclaim] ${now} from ${item.owner_session ?? "none"} to ${opts.ownerSession}`;
   const notes = [item.notes, historyNote].filter(Boolean).join(`
@@ -412,9 +258,6 @@ function matchedOf(item, key) {
     return;
   return { ticket: item.id, ref: compactRef(item.canonical_key) };
 }
-function recordLastPreflight(db, sessionID, res) {
-  db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [`last_preflight:${sessionID}`, JSON.stringify({ status: res.status, next_action: res.next_action ?? null, ticket: res.ticket ?? null })]);
-}
 function preflight(db, opts) {
   let res;
   if (opts.reclaimTicket) {
@@ -422,12 +265,12 @@ function preflight(db, opts) {
       res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts });
       res = { ...res, reclaim_error: "reclaim_owner is required: pass the owner_session observed in the IN_PROGRESS preflight result" };
     } else {
-      const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, task: opts.task, ownerSession: opts.ownerSession, previousOwner: opts.reclaimOwner });
+      const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, ownerSession: opts.ownerSession, previousOwner: opts.reclaimOwner });
       if (r.ok) {
         const key = normalizeKey(opts.task);
         const readFirst = readFirstFor(db, key, opts.fts);
         const sc = ensureScratch(projectScratchBase(opts.projectDir), r.item.id);
-        res = { status: "NEW", ticket: r.item.id, match_reason: "reclaimed", established: [], do_not_repeat: [], unresolved: r.item.unresolved ? [r.item.unresolved] : [opts.task], evidence: evidenceFor(db, r.item.id).slice(0, 10), read_first: readFirst, scratch: sc, owner_session: opts.ownerSession, candidates: [], reclaimed: { previous_owner: r.previous_owner, reclaimed_at: r.reclaimed_at }, next_action: "DELEGATE" };
+        res = { status: "NEW", ticket: r.item.id, match_reason: "reclaimed", established: [], do_not_repeat: [], unresolved: r.item.unresolved ? [r.item.unresolved] : [opts.task], evidence: evidenceFor(db, r.item.id).slice(0, 10), read_first: readFirst, scratch: sc, owner_session: opts.ownerSession, candidates: [], reclaimed: { previous_owner: r.previous_owner, reclaimed_at: r.reclaimed_at } };
       } else {
         res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts });
         res = { ...res, reclaim_error: r.reason };
@@ -436,15 +279,7 @@ function preflight(db, opts) {
   } else {
     res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts });
   }
-  recordLastPreflight(db, opts.ownerSession, res);
   return res;
-}
-function inProgressAction(item, currentSession) {
-  if (item.worker_session)
-    return "STEER";
-  if (item.owner_session && item.owner_session !== currentSession)
-    return "WAIT";
-  return "DELEGATE";
 }
 function preflightCore(db, opts) {
   const key = normalizeKey(opts.task);
@@ -479,37 +314,24 @@ function preflightCore(db, opts) {
   const cap = (a, n) => a.slice(0, n);
   if (item) {
     if (item.status === "in_progress") {
-      return { status: "IN_PROGRESS", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], owner_session: item.owner_session ?? undefined, next_action: inProgressAction(item, opts.ownerSession), worker_session: item.worker_session ?? undefined };
+      return { status: "IN_PROGRESS", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], owner_session: item.owner_session ?? undefined };
     }
     if (item.status === "done" || item.status === "covered" || item.status === "blocked") {
       const unresolved = item.unresolved ? [item.unresolved] : [];
       if (item.status === "blocked")
         unresolved.unshift(`BLOCKED: ${item.summary}`);
-      return { status: "COVERED", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${compactRef(item.canonical_key)} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], next_action: "USE_EXISTING" };
+      return { status: "COVERED", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${compactRef(item.canonical_key)} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] };
     }
     if (opts.claim) {
       const priorNote = item.status === "failed" ? "prior failed attempt: " + [item.summary, item.notes].filter(Boolean).join(" | ") : "";
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: priorNote, ownerSession: opts.ownerSession, source: "agent" });
       if (c.ok) {
         const sc = ensureScratch(scratchBase, c.item.id);
-        return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], next_action: "DELEGATE" };
+        return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] };
       }
-      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
+      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined };
     }
-    return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], next_action: "DELEGATE" };
-  }
-  let reuseDenied = [];
-  let reuseConsidered = [];
-  const inProgressCandidates = candidates.filter((c) => c.status === "in_progress");
-  if (inProgressCandidates.length > 0) {
-    const scored = inProgressCandidates.map((c) => ({ c, overlap: tokenOverlap(key, `${c.canonical_key} ${c.summary} ${c.unresolved}`) }));
-    const best = scored.reduce((a, b) => b.overlap > a.overlap || b.overlap === a.overlap && (b.c.fts_rank ?? 0) < (a.c.fts_rank ?? 0) ? b : a);
-    reuseConsidered = scored.map(({ c, overlap }) => ({ id: c.id, ref: compactRef(c.canonical_key), overlap, selected: c.id === best.c.id }));
-    if (best.overlap >= MIN_SEMANTIC_OVERLAP) {
-      const c = best.c;
-      return { status: "IN_PROGRESS", ticket: c.id, match_reason: "semantic-continuation", match_score: best.overlap, matched: matchedOf(c, key), established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered, owner_session: c.owner_session ?? undefined, next_action: inProgressAction(c, opts.ownerSession), worker_session: c.worker_session ?? undefined };
-    }
-    reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, ref: compactRef(c.canonical_key), overlap }));
+    return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] };
   }
   const doneCandidates = candidates.filter((c) => c.status === "done" || c.status === "covered" || c.status === "blocked");
   if (doneCandidates.length > 0) {
@@ -521,21 +343,21 @@ function preflightCore(db, opts) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: `delta of ${doneCandidates[0].canonical_key}`, ownerSession: opts.ownerSession, parentKey: doneCandidates[0].canonical_key, source: "agent" });
       if (c.ok) {
         const sc = ensureScratch(scratchBase, c.item.id);
-        return { status: "PARTIAL", ticket: c.item.id, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE_DELTA" };
+        return { status: "PARTIAL", ticket: c.item.id, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand };
       }
-      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
+      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, owner_session: c.inProgress.owner_session ?? undefined };
     }
-    return { status: "PARTIAL", match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE_DELTA" };
+    return { status: "PARTIAL", match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand };
   }
   if (opts.claim) {
     const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" });
     if (c.ok) {
       const sc = ensureScratch(scratchBase, c.item.id);
-      return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE" };
+      return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] };
     }
-    return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
+    return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined };
   }
-  return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE" };
+  return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] };
 }
 function recordResult(db, opts) {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
@@ -548,9 +370,6 @@ function recordResult(db, opts) {
     const exists = db.query("SELECT 1 FROM evidence WHERE work_item_id=? AND path=?").get(opts.ticket, p);
     if (!exists)
       db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [opts.ticket, p, "file", ""]);
-  }
-  for (const f of opts.facts ?? []) {
-    db.run("INSERT INTO facts (key, value, source, updated_at) VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, source=excluded.source, updated_at=excluded.updated_at", [f.key, f.value, `ticket:${opts.ticket}`, now]);
   }
   return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) };
 }
@@ -578,147 +397,12 @@ function appendFailure(db, opts) {
   }
   return { id, path: file };
 }
-var GOAL_START = "<!-- PROJECT-MEMORY:CURRENT-START -->";
-var GOAL_END = "<!-- PROJECT-MEMORY:CURRENT-END -->";
-function checkpointGoal(projectDir, content) {
-  const dir = path.join(projectDir, ".opencode");
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, "goal-state.md");
-  let existing = "";
-  if (fs.existsSync(file))
-    existing = fs.readFileSync(file, "utf8");
-  const s = existing.indexOf(GOAL_START);
-  const e = existing.indexOf(GOAL_END);
-  let next;
-  if (s === -1 || e === -1 || e < s) {
-    const sep = existing.length > 0 && !existing.endsWith(`
-`) ? `
-` : "";
-    next = existing + sep + GOAL_START + `
-` + content + `
-` + GOAL_END + `
-`;
-  } else {
-    next = existing.slice(0, s + GOAL_START.length) + `
-` + content + `
-` + existing.slice(e);
-  }
-  const tmp = path.join(dir, `.goal-state.md.tmp-${process.pid}`);
-  fs.writeFileSync(tmp, next, "utf8");
-  fs.renameSync(tmp, file);
-  return { path: file, bytes: Buffer.byteLength(next) };
-}
-function mapStatus(statoLine) {
-  const s = statoLine.toLowerCase();
-  if (s.includes("bloccato"))
-    return "blocked";
-  if (s.includes("dead"))
-    return "done";
-  if (s.includes("fatto"))
-    return "done";
-  return "new";
-}
-function importVectors(db, file) {
-  const content = fs.readFileSync(file, "utf8");
-  const sections = [];
-  let current = null;
-  for (const line of content.split(`
-`)) {
-    if (line.startsWith("### ")) {
-      current = { title: line.slice(4).trim(), lines: [] };
-      sections.push(current);
-    } else if (current)
-      current.lines.push(line);
-  }
-  for (const s of sections) {
-    const key = normalizeKey(s.title.split("(")[0]);
-    const stato = s.lines.find((l) => l.includes("**Stato**")) ?? "";
-    const sintesi = s.lines.find((l) => l.includes("**Sintesi**")) ?? "";
-    const evidenza = s.lines.find((l) => l.includes("**Evidenza**")) ?? "";
-    const nonRipetere = s.lines.find((l) => l.includes("**NON ripetere**")) ?? "";
-    const riap = s.lines.find((l) => l.includes("**Riapertura**")) ?? "";
-    const status = mapStatus(stato);
-    const summary = stripMarkdown(sintesi.replace(/^.*?\*\*Sintesi\*\*\s*:?\s*/, "")).slice(0, 500);
-    const notes = [
-      nonRipetere ? `NON RIPETERE: ${stripMarkdown(nonRipetere.replace(/^.*?\*\*NON ripetere\*\*\s*:?\s*/, "")).slice(0, 500)}` : "",
-      riap ? `Riapertura: ${stripMarkdown(riap.replace(/^.*?\*\*Riapertura\*\*\s*:?\s*/, "")).slice(0, 300)}` : ""
-    ].filter(Boolean).join(`
-`);
-    const unresolved = riap ? stripMarkdown(riap.replace(/^.*?\*\*Riapertura\*\*\s*:?\s*/, "")).slice(0, 300) : "";
-    const id = ulid();
-    const now = nowIso();
-    db.run("INSERT INTO work_items (id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at) VALUES (?,?,?,?,?,?,NULL,NULL,'bootstrap:VECTORS.md',?,?)", [id, key, status, summary, unresolved, notes, now, now]);
-    db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [id, normalizeKey(s.title)]);
-    db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, file, "vectors", s.title]);
-    const all = s.lines.join(`
-`);
-    for (const m of all.matchAll(/FAIL-\d+/g)) {
-      db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [id, normalizeKey(m[0])]);
-      db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, m[0], "fail", ""]);
-    }
-    for (const m of all.matchAll(/report_[a-z0-9_]+\.md/g)) {
-      db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, m[0], "report", ""]);
-    }
-  }
-}
-function importFailures(db, file) {
-  const content = fs.readFileSync(file, "utf8");
-  const sections = [];
-  let current = null;
-  for (const line of content.split(`
-`)) {
-    if (line.startsWith("## ")) {
-      current = { title: line.slice(3).trim(), lines: [] };
-      sections.push(current);
-    } else if (current)
-      current.lines.push(line);
-  }
-  for (const s of sections) {
-    const m = s.title.match(/FAIL-\d+/i);
-    if (!m)
-      continue;
-    const key = normalizeKey(m[0]);
-    const first = s.lines.find((l) => l.trim().length > 0) ?? "";
-    const summary = stripMarkdown(first).slice(0, 300);
-    const now = nowIso();
-    const existing = db.query("SELECT * FROM work_items WHERE canonical_key=?").get(key);
-    if (existing) {
-      db.run("UPDATE work_items SET summary=?, updated_at=? WHERE id=?", [summary || existing.summary, now, existing.id]);
-      db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [existing.id, file, "failures", s.title]);
-    } else {
-      const id = ulid();
-      db.run("INSERT INTO work_items (id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at) VALUES (?,?,'done',?,'','',NULL,NULL,'bootstrap:FAILURES.md',?,?)", [id, key, summary, now, now]);
-      db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [id, key]);
-      db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, file, "failures", s.title]);
-    }
-  }
-}
-function importReportsIndex(db, file, projectDir) {
-  const content = fs.readFileSync(file, "utf8");
-  for (const line of content.split(`
-`)) {
-    const m = line.match(/^\|\s*(report_[a-z0-9_]+\.md)\s*\|\s*(.*?)\s*\|\s*(\w+)\s*\|/);
-    if (!m)
-      continue;
-    const report = m[1];
-    const sintesi = m[2];
-    const stato = m[3].toLowerCase();
-    const key = normalizeKey(report.replace(/\.md$/, ""));
-    const status = stato.includes("fatto") || stato.includes("dead") ? "done" : "new";
-    const id = ulid();
-    const now = nowIso();
-    db.run("INSERT INTO work_items (id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at) VALUES (?,?,?,?,'','',NULL,NULL,'bootstrap:REPORTS_INDEX.md',?,?)", [id, key, status, sintesi.slice(0, 300), now, now]);
-    db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [id, normalizeKey(report)]);
-    db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, path.join(projectDir, ".opencode", report), "report", ""]);
-  }
-}
 function bootstrap(db, projectDir, fts) {
+  if (!fts)
+    return { imported: 0, sources: [] };
   const dir = path.join(projectDir, ".opencode");
   const sources = [];
-  const tx = db.transaction(() => {
-    const prev = db.query("SELECT id FROM work_items WHERE source LIKE 'bootstrap:%'").all();
-    for (const r of prev)
-      db.run("DELETE FROM work_items WHERE id=?", [r.id]);
+  db.transaction(() => {
     db.exec("DELETE FROM markdown_fts");
     const mdFiles = [];
     if (fs.existsSync(dir)) {
@@ -738,56 +422,9 @@ function bootstrap(db, projectDir, fts) {
         sources.push(f);
       } catch {}
     }
-    const vectors = path.join(dir, "VECTORS.md");
-    if (fs.existsSync(vectors))
-      importVectors(db, vectors);
-    const failures = path.join(dir, "FAILURES.md");
-    if (fs.existsSync(failures))
-      importFailures(db, failures);
-    const reportsIndex = path.join(dir, "REPORTS_INDEX.md");
-    if (fs.existsSync(reportsIndex))
-      importReportsIndex(db, reportsIndex, projectDir);
-    const goalState = path.join(dir, "goal-state.md");
-    if (fs.existsSync(goalState)) {
-      const content = fs.readFileSync(goalState, "utf8");
-      db.run("INSERT INTO facts (key, value, source, updated_at) VALUES ('goal-state', ?, 'bootstrap', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, source=excluded.source, updated_at=excluded.updated_at", [content.slice(0, 1e5), nowIso()]);
-    }
-  });
-  tx();
+  })();
   syncAllFts(db, fts);
-  const n = db.query("SELECT COUNT(*) AS n FROM work_items WHERE source LIKE 'bootstrap:%'").get().n;
-  return { imported: n, sources };
-}
-function gateDecision(db, opts) {
-  const args = opts.args ?? {};
-  if (args.task_id)
-    return { action: "allow", reason: "steering" };
-  const st = args.subagent_type;
-  if (st === "vision" || st === "verifier")
-    return { action: "allow", reason: `exempt: ${st}` };
-  const claim = db.query("SELECT * FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1").get(opts.sessionID);
-  if (claim) {
-    if (claim.worker_session) {
-      return { action: "block", reason: "project-memory gate: a worker is already delegated for this work (session " + claim.worker_session + "). Do not retry task() \u2014 steer the existing worker via task_id, or reclaim only if orphaned. (Set PROJECT_MEMORY_GATE=warn to relax.)" };
-    }
-    return { action: "allow", reason: "preflight ticket", ticket: claim.id };
-  }
-  const lastRaw = db.query("SELECT value FROM meta WHERE key=?").get(`last_preflight:${opts.sessionID}`)?.value;
-  let last;
-  if (lastRaw) {
-    try {
-      last = JSON.parse(lastRaw);
-    } catch {
-      last = undefined;
-    }
-  }
-  if (last?.status === "IN_PROGRESS") {
-    return { action: "block", reason: "project-memory gate: this work is already in progress. Do not retry task(). Follow next_action from project_work_check (" + (last.next_action ?? "WAIT") + "), or reclaim only if orphaned. (Set PROJECT_MEMORY_GATE=warn to relax.)" };
-  }
-  return { action: "block", reason: "project-memory gate: no valid project_work_check for this session. Run project_work_check(work=...) before delegating. (Set PROJECT_MEMORY_GATE=warn to relax.)" };
-}
-function bindClaimToChild(db, parentID, childSessionID) {
-  db.run("UPDATE work_items SET worker_session=?, updated_at=? WHERE id=(SELECT id FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1)", [childSessionID, nowIso(), parentID]);
+  return { imported: 0, sources };
 }
 function openHandle(dbPath) {
   return { db: openMemory(dbPath), path: dbPath };
@@ -852,20 +489,6 @@ function preflightSafe(handle, opts) {
   } catch (e) {
     const cause = e instanceof MemoryError ? e.cause !== undefined ? String(e.cause) : e.message : String(e?.message ?? e);
     return { handle, result: { status: "MEMORY_ERROR", canonical_key: key, error: { message: "project memory preflight unavailable or inconclusive", cause } } };
-  }
-}
-function gateSafe(handle, opts) {
-  const args = opts.args ?? {};
-  if (args.task_id)
-    return { handle, decision: { action: "allow", reason: "steering" } };
-  const st = args.subagent_type;
-  if (st === "vision" || st === "verifier")
-    return { handle, decision: { action: "allow", reason: `exempt: ${st}` } };
-  try {
-    const { handle: h, value } = runWithRecovery(handle, (db) => gateDecision(db, opts));
-    return { handle: h, decision: value };
-  } catch {
-    return { handle, decision: { action: "block", reason: "Project memory preflight is unavailable or inconclusive. Delegation blocked to avoid repeating or conflicting work." } };
   }
 }
 
@@ -951,20 +574,14 @@ function resolveIdea(db, ref) {
     return { id: byKey.id, canonical_key: byKey.canonical_key };
   return null;
 }
-function resolveTarget(db, target, autoCreate) {
+function resolveTarget(db, target) {
   if (typeof target !== "string" || !target)
     return null;
   if (target.startsWith("condition:")) {
     const k2 = normalizeKey(target.slice("condition:".length));
     if (!k2)
       return null;
-    let row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k2);
-    if (!row && autoCreate) {
-      const id = ulid();
-      const now = nowIso();
-      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,0,'',?,?)", [id, k2, k2, now, now]);
-      row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k2);
-    }
+    const row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k2);
     if (!row)
       return null;
     return { target_type: "condition", target_id: row.id, target_key: row.canonical_key };
@@ -973,13 +590,7 @@ function resolveTarget(db, target, autoCreate) {
     const k2 = normalizeKey(target.slice("idea:".length));
     if (!k2)
       return null;
-    let row = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(k2);
-    if (!row && autoCreate) {
-      const id = ulid();
-      const now = nowIso();
-      db.run("INSERT INTO ideas (id, canonical_key, title, summary, status, rationale, evidence, created_at, updated_at) VALUES (?,?,?,?,'proposed','','',?,?)", [id, k2, k2, "", now, now]);
-      row = db.query("SELECT * FROM ideas WHERE id=?").get(id);
-    }
+    const row = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(k2);
     if (!row)
       return null;
     return { target_type: "idea", target_id: row.id, target_key: row.canonical_key };
@@ -1032,6 +643,8 @@ function ideaRecord(db, opts = {}) {
   const ideaOpts = { ...opts.idea ?? {} };
   if (opts.status !== undefined && ideaOpts.status === undefined)
     ideaOpts.status = opts.status;
+  if (opts.evidence !== undefined && ideaOpts.evidence === undefined)
+    ideaOpts.evidence = opts.evidence;
   const hasId = typeof ideaOpts.id === "string" && ideaOpts.id.length > 0;
   let key = "";
   let existingRow;
@@ -1046,15 +659,110 @@ function ideaRecord(db, opts = {}) {
       return { ok: false, error: "idea.key or idea.id required" };
     existingRow = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(key);
   }
+  const ideaId = existingRow?.id ?? ulid();
   let statusProvided = false;
+  let status = existingRow?.status ?? "proposed";
   if (typeof ideaOpts.status === "string" && ideaOpts.status !== "") {
-    if (IDEA_STATUSES.includes(ideaOpts.status))
+    if (IDEA_STATUSES.includes(ideaOpts.status)) {
       statusProvided = true;
-    else
+      status = ideaOpts.status;
+    } else
       errors.push(`invalid idea status '${ideaOpts.status}' (expected one of: ${IDEA_STATUSES.join(", ")})`);
   }
+  const evidence = typeof ideaOpts.evidence === "string" ? ideaOpts.evidence : existingRow?.evidence ?? "";
+  if (status === "validated" || status === "disproven") {
+    if (typeof evidence !== "string" || evidence.trim() === "") {
+      errors.push(`status '${status}' requires non-empty evidence`);
+    }
+  }
+  const condSpecs = [];
+  for (const c of opts.conditions ?? []) {
+    const ckey = normalizeKey(typeof c.key === "string" ? c.key : "");
+    if (!ckey) {
+      errors.push(`condition key required (got ${JSON.stringify(c.key)})`);
+      continue;
+    }
+    if (c.satisfied === true && !(typeof c.satisfied_by === "string" && c.satisfied_by.trim() !== "")) {
+      errors.push(`condition '${ckey}' satisfied=true requires satisfied_by (explicit provenance)`);
+    }
+    condSpecs.push({ key: ckey, description: c.description, satisfied: c.satisfied, satisfied_by: c.satisfied_by });
+  }
+  const satisfiesSpecs = [];
+  for (const s of opts.satisfies ?? []) {
+    const skey = normalizeKey(typeof s === "string" ? s : "");
+    if (!skey) {
+      errors.push(`satisfies key required (got ${JSON.stringify(s)})`);
+      continue;
+    }
+    const cond = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(skey);
+    if (!cond) {
+      errors.push(`satisfies target condition not found: ${skey}`);
+      continue;
+    }
+    satisfiesSpecs.push(skey);
+  }
+  if (opts.satisfies?.length) {
+    if (status !== "validated")
+      errors.push("satisfies requires the idea to be validated");
+    if (evidence.trim() === "")
+      errors.push("satisfies requires the idea to carry evidence");
+  }
+  const resolveSource = (ref) => {
+    const existing = resolveIdea(db, ref);
+    if (existing)
+      return existing;
+    if (typeof ref === "string" && (ref === ideaId || normalizeKey(ref) === key))
+      return { id: ideaId, canonical_key: key };
+    return null;
+  };
+  const relSpecs = [];
+  for (const r of opts.relations ?? []) {
+    const src = resolveSource(r.idea);
+    if (!src) {
+      errors.push(`relation source idea not found: ${r.idea}`);
+      continue;
+    }
+    if (!RELATION_KINDS.includes(r.kind)) {
+      errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`);
+      continue;
+    }
+    const tr = resolveTarget(db, r.target);
+    if (!tr) {
+      errors.push(`relation target not found: ${r.target}`);
+      continue;
+    }
+    relSpecs.push({ ideaId: src.id, ideaKey: src.canonical_key, kind: r.kind, targetType: tr.target_type, targetId: tr.target_id, targetKey: tr.target_key, note: typeof r.note === "string" ? r.note : "" });
+  }
+  const remSpecs = [];
+  for (const r of opts.remove_relations ?? []) {
+    const src = resolveSource(r.idea);
+    if (!src) {
+      errors.push(`relation source idea not found: ${r.idea}`);
+      continue;
+    }
+    if (!RELATION_KINDS.includes(r.kind)) {
+      errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`);
+      continue;
+    }
+    const tr = resolveTarget(db, r.target);
+    if (!tr) {
+      errors.push(`relation target not found: ${r.target}`);
+      continue;
+    }
+    remSpecs.push({ ideaId: src.id, ideaKey: src.canonical_key, kind: r.kind, targetType: tr.target_type, targetId: tr.target_id, targetKey: tr.target_key });
+  }
+  if (errors.length > 0) {
+    return { ok: false, error: errors.join("; "), errors };
+  }
+  try {
+    return db.transaction(() => applyIdeaRecord(db, { ideaId, ideaOpts, key, existingRow, statusProvided, status, evidence, condSpecs, satisfiesSpecs, relSpecs, remSpecs }))();
+  } catch (e) {
+    return { ok: false, error: `idea_save failed: ${e?.message ?? e}` };
+  }
+}
+function applyIdeaRecord(db, cfg) {
+  const { ideaId, ideaOpts, key, existingRow, statusProvided, status, evidence, condSpecs, satisfiesSpecs, relSpecs, remSpecs } = cfg;
   const now = nowIso();
-  const ideaId = existingRow?.id ?? ulid();
   if (existingRow) {
     const sets = [];
     const vals = [];
@@ -1066,7 +774,7 @@ function ideaRecord(db, opts = {}) {
     }
     if (statusProvided) {
       sets.push("status=?");
-      vals.push(ideaOpts.status);
+      vals.push(status);
     }
     sets.push("updated_at=?");
     vals.push(now);
@@ -1078,7 +786,7 @@ function ideaRecord(db, opts = {}) {
       key,
       typeof ideaOpts.title === "string" ? ideaOpts.title : "",
       typeof ideaOpts.summary === "string" ? ideaOpts.summary : "",
-      statusProvided ? ideaOpts.status : "proposed",
+      statusProvided ? status : "proposed",
       typeof ideaOpts.rationale === "string" ? ideaOpts.rationale : "",
       typeof ideaOpts.evidence === "string" ? ideaOpts.evidence : "",
       now,
@@ -1087,20 +795,15 @@ function ideaRecord(db, opts = {}) {
   }
   syncIdeaFts(db, ideaId);
   const condTouched = new Map;
-  for (const c of opts.conditions ?? []) {
-    const ckey = normalizeKey(typeof c.key === "string" ? c.key : "");
-    if (!ckey) {
-      errors.push(`condition key required (got ${JSON.stringify(c.key)})`);
-      continue;
-    }
-    const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(ckey);
+  for (const c of condSpecs) {
+    const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(c.key);
     const cid = existing?.id ?? ulid();
-    const desc = typeof c.description === "string" ? c.description : existing?.description ?? "";
+    const desc = typeof c.description === "string" ? c.description : existing?.description ?? c.key;
     let satisfied;
     let satisfiedBy;
     if (typeof c.satisfied === "boolean") {
       satisfied = c.satisfied ? 1 : 0;
-      satisfiedBy = c.satisfied ? typeof c.satisfied_by === "string" && c.satisfied_by !== "" ? c.satisfied_by : existing?.satisfied_by ?? "orchestrator" : "";
+      satisfiedBy = c.satisfied ? typeof c.satisfied_by === "string" ? c.satisfied_by : "" : "";
     } else {
       satisfied = existing?.satisfied ?? 0;
       satisfiedBy = existing?.satisfied_by ?? "";
@@ -1122,66 +825,27 @@ function ideaRecord(db, opts = {}) {
     if (existing) {
       db.run(`UPDATE conditions SET ${sets.join(", ")} WHERE id=?`, [...vals, existing.id]);
     } else {
-      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?)", [cid, ckey, desc, satisfied, satisfiedBy, now, now]);
+      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?)", [cid, c.key, desc, satisfied, satisfiedBy, now, now]);
     }
-    condTouched.set(ckey, { key: ckey, description: desc, satisfied: satisfied === 1, satisfied_by: satisfiedBy });
+    condTouched.set(c.key, { key: c.key, description: desc, satisfied: satisfied === 1, satisfied_by: satisfiedBy });
   }
-  for (const s of opts.satisfies ?? []) {
-    const skey = normalizeKey(typeof s === "string" ? s : "");
-    if (!skey) {
-      errors.push(`satisfies key required (got ${JSON.stringify(s)})`);
-      continue;
-    }
+  for (const skey of satisfiesSpecs) {
     const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(skey);
-    const cid = existing?.id ?? ulid();
-    const satisfiedBy = key;
-    const desc = existing?.description ?? skey;
-    const now2 = nowIso();
-    if (existing) {
-      db.run("UPDATE conditions SET satisfied=1, satisfied_by=?, updated_at=? WHERE id=?", [satisfiedBy, now2, existing.id]);
-    } else {
-      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,1,?,?,?)", [cid, skey, desc, satisfiedBy, now2, now2]);
-    }
-    condTouched.set(skey, { key: skey, description: desc, satisfied: true, satisfied_by: satisfiedBy });
+    if (!existing)
+      continue;
+    db.run("UPDATE conditions SET satisfied=1, satisfied_by=?, updated_at=? WHERE id=?", [ideaId, now, existing.id]);
+    condTouched.set(skey, { key: skey, description: existing.description, satisfied: true, satisfied_by: ideaId });
   }
   const addedRelations = [];
-  for (const r of opts.relations ?? []) {
-    const src = resolveIdea(db, r.idea);
-    if (!src) {
-      errors.push(`relation source idea not found: ${r.idea}`);
-      continue;
-    }
-    if (!RELATION_KINDS.includes(r.kind)) {
-      errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`);
-      continue;
-    }
-    const tr = resolveTarget(db, r.target, true);
-    if (!tr) {
-      errors.push(`relation target not found: ${r.target}`);
-      continue;
-    }
-    const res = db.run("INSERT OR IGNORE INTO idea_relations (idea_id, kind, target_type, target_id, note) VALUES (?,?,?,?,?)", [src.id, r.kind, tr.target_type, tr.target_id, typeof r.note === "string" ? r.note : ""]);
+  for (const r of relSpecs) {
+    const res = db.run("INSERT OR IGNORE INTO idea_relations (idea_id, kind, target_type, target_id, note) VALUES (?,?,?,?,?)", [r.ideaId, r.kind, r.targetType, r.targetId, r.note ?? ""]);
     if (res.changes > 0) {
-      addedRelations.push({ idea: src.canonical_key, kind: r.kind, target: (tr.target_type === "idea" ? "idea:" : "condition:") + tr.target_key });
+      addedRelations.push({ idea: r.ideaKey, kind: r.kind, target: (r.targetType === "idea" ? "idea:" : "condition:") + r.targetKey });
     }
   }
   let removedRelations = 0;
-  for (const r of opts.remove_relations ?? []) {
-    const src = resolveIdea(db, r.idea);
-    if (!src) {
-      errors.push(`relation source idea not found: ${r.idea}`);
-      continue;
-    }
-    if (!RELATION_KINDS.includes(r.kind)) {
-      errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`);
-      continue;
-    }
-    const tr = resolveTarget(db, r.target, false);
-    if (!tr) {
-      errors.push(`relation target not found: ${r.target}`);
-      continue;
-    }
-    const del = db.run("DELETE FROM idea_relations WHERE idea_id=? AND kind=? AND target_type=? AND target_id=?", [src.id, r.kind, tr.target_type, tr.target_id]);
+  for (const r of remSpecs) {
+    const del = db.run("DELETE FROM idea_relations WHERE idea_id=? AND kind=? AND target_type=? AND target_id=?", [r.ideaId, r.kind, r.targetType, r.targetId]);
     removedRelations += del.changes;
   }
   const finalRow = db.query("SELECT * FROM ideas WHERE id=?").get(ideaId);
@@ -1203,7 +867,6 @@ function ideaRecord(db, opts = {}) {
     },
     conditions: [...condTouched.values()].slice(0, 20),
     relations: addedRelations.slice(0, 20),
-    errors,
     removed_relations: removedRelations
   };
 }
@@ -1291,7 +954,6 @@ function projectFrontier(db, opts = {}) {
 
 // project-memory.ts
 var PRIMARY_AGENTS = (process.env.PROJECT_MEMORY_PRIMARY_AGENTS ?? "orchestrator,orchestrator-goal").split(",").map((s) => s.trim()).filter(Boolean);
-var GATE_MODE = process.env.PROJECT_MEMORY_GATE ?? "strict";
 var project_memory_default = {
   id: "project-memory",
   server: async (ctx) => {
@@ -1309,12 +971,11 @@ var project_memory_default = {
       console.error("[project-memory] init failed:", e);
       handle = null;
     }
-    const warnCalls = new Set;
     const isPrimary = (agent) => PRIMARY_AGENTS.includes(agent);
     return {
       tool: {
         project_work_check: tool({
-          description: "Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress.",
+          description: "Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress. Semantics: NEW = new work; PARTIAL = use established context and do unresolved work; COVERED = reuse the stored result; IN_PROGRESS = do not duplicate, reclaim only if known orphaned; MEMORY_ERROR = memory is uncertain.",
           args: {
             work: tool.schema.string().describe("Work to check in project memory"),
             claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
@@ -1341,14 +1002,13 @@ var project_memory_default = {
           }
         }),
         project_work_save: tool({
-          description: "Save durable results, evidence and reusable facts learned from work.",
+          description: "Save durable results and evidence learned from work.",
           args: {
             ticket: tool.schema.string().describe("Work item id from project_work_check"),
             status: tool.schema.enum(["done", "blocked", "failed"]),
             summary: tool.schema.string().optional().describe("Result summary"),
             unresolved: tool.schema.string().optional().describe("Remaining unresolved delta, if any"),
-            evidence: tool.schema.array(tool.schema.string()).optional().describe("File paths / report ids produced"),
-            facts: tool.schema.array(tool.schema.object({ key: tool.schema.string(), value: tool.schema.string() })).optional().describe("Reusable facts learned")
+            evidence: tool.schema.array(tool.schema.string()).optional().describe("File paths / report ids produced")
           },
           execute: async (args, tctx) => {
             if (!handle)
@@ -1363,16 +1023,6 @@ var project_memory_default = {
             } catch (e) {
               return JSON.stringify({ ok: false, error: `record failed: ${e?.message ?? e}` });
             }
-          }
-        }),
-        project_goal_update: tool({
-          description: "Update goal progress worth preserving across compaction or continuation.",
-          args: { progress: tool.schema.string().describe("Goal progress to preserve") },
-          execute: async (args, tctx) => {
-            if (!isPrimary(tctx.agent ?? ""))
-              return JSON.stringify({ ok: false, error: "only primary agents can update goal-state" });
-            const res = checkpointGoal(directory, args.progress);
-            return JSON.stringify({ ok: true, ...res });
           }
         }),
         project_failure_save: tool({
@@ -1398,7 +1048,7 @@ var project_memory_default = {
           }
         }),
         project_idea_save: tool({
-          description: "Save or update a durable idea, prerequisite and its relations.",
+          description: "Save or update a durable idea, prerequisite and its relations. validated/disproven require non-empty evidence; satisfied conditions require explicit provenance; satisfies only works from a validated idea with evidence. Invalid input is atomic: ok:false with no partial writes.",
           args: {
             idea: tool.schema.object({
               key: tool.schema.string().optional(),
@@ -1419,8 +1069,8 @@ var project_memory_default = {
               idea: tool.schema.string(),
               kind: tool.schema.enum(RELATION_KINDS),
               target: tool.schema.string()
-            })).optional().describe("Relations to add"),
-            satisfies: tool.schema.array(tool.schema.string()).optional().describe("Condition keys this idea satisfies"),
+            })).optional().describe("Relations to add (targets must already exist)"),
+            satisfies: tool.schema.array(tool.schema.string()).optional().describe("Condition keys this validated idea satisfies"),
             remove_relations: tool.schema.array(tool.schema.object({
               idea: tool.schema.string(),
               kind: tool.schema.enum(RELATION_KINDS),
@@ -1457,51 +1107,6 @@ var project_memory_default = {
             }
           }
         })
-      },
-      event: async ({ event }) => {
-        if (!handle)
-          return;
-        const p = event?.properties;
-        if (!p?.sessionID)
-          return;
-        if (typeof event.type === "string" && event.type.includes("session.created")) {
-          const parentID = p.info?.parentID;
-          if (parentID) {
-            try {
-              bindClaimToChild(handle.db, parentID, p.sessionID);
-            } catch (e) {
-              console.error("[project-memory] bindClaimToChild failed:", e);
-            }
-          }
-        }
-      },
-      "tool.execute.before": async (input, output) => {
-        if (input.tool !== "task")
-          return;
-        if (GATE_MODE === "off")
-          return;
-        if (!handle) {
-          if (GATE_MODE === "strict")
-            throw new Error("Project memory preflight is unavailable or inconclusive. Delegation blocked to avoid repeating or conflicting work.");
-          warnCalls.add(input.callID);
-          return;
-        }
-        const { handle: h, decision } = gateSafe(handle, { sessionID: input.sessionID, args: output?.args ?? {} });
-        handle = h;
-        if (decision.action === "block") {
-          throw new Error(decision.reason ?? "project-memory gate: preflight required");
-        }
-        if (decision.action === "warn") {
-          warnCalls.add(input.callID);
-        }
-      },
-      "tool.execute.after": async (input, output) => {
-        if (input.tool === "task" && warnCalls.has(input.callID)) {
-          warnCalls.delete(input.callID);
-          output.output = (output.output ?? "") + `
-
-[project-memory] WARNING: task delegated without a project preflight ticket.`;
-        }
       }
     };
   }

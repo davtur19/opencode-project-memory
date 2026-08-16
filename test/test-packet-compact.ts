@@ -148,28 +148,32 @@ const SUMMARY_BLOCKED = "VOX30 smtpc email RCE static sink analysis — delegati
   check("C11 COVERED after record", r3.status === "COVERED" && r3.ticket === r1.ticket, JSON.stringify(r3))
 }
 
-// C12 — claim ownership + worker binding unchanged (gate blocks a duplicate
-// delegation once a worker is bound; steering via task_id stays allowed).
+// C12 — no scheduler remnants in the preflight output: no worker_session field,
+// no next_action field, no gate, no bind. Claim ownership stays a plain record.
 {
   const { db, dir, fts } = freshDb("c12")
   const t = claim(db, "task g12b", "ses_parent")
-  PM.bindClaimToChild(db, "ses_parent", "ses_child")
-  const row = db.query("SELECT * FROM work_items WHERE id=?").get(t) as any
-  check("C12 owner kept + child bound", row.owner_session === "ses_parent" && row.worker_session === "ses_child", JSON.stringify(row))
-  check("C12 gate blocks duplicate delegation", PM.gateDecision(db, { sessionID: "ses_parent", args: { subagent_type: "subagent" } }).action === "block")
-  check("C12 gate allows steering via task_id", PM.gateDecision(db, { sessionID: "ses_parent", args: { task_id: "ses_child" } }).action === "allow")
   const r = PM.preflight(db, { task: "task g12b", claim: true, ownerSession: "ses_parent", projectDir: dir, fts })
-  check("C12 IN_PROGRESS worker exposed", r.status === "IN_PROGRESS" && r.worker_session === "ses_child" && r.next_action === "STEER", JSON.stringify(r))
+  check("C12 IN_PROGRESS same ticket", r.status === "IN_PROGRESS" && r.ticket === t && r.owner_session === "ses_parent", JSON.stringify(r))
+  const p = JSON.stringify(r)
+  check("C12 no next_action field", !p.includes("next_action"), p.slice(0, 160))
+  check("C12 no worker_session field", !p.includes("worker_session"), p.slice(0, 160))
+  check("C12 no gate exports", (PM as any).gateDecision === undefined && (PM as any).gateSafe === undefined)
+  check("C12 no bind export", (PM as any).bindClaimToChild === undefined)
 }
 
-// C13 — reclaim CAS unchanged.
+// C13 — reclaim CAS unchanged: reclaim relies on explicit ticket + observed-owner
+// CAS. The request text is not gated (caller passes the right ticket); a wrong
+// observed owner is denied by the CAS.
 {
   const { db, dir, fts } = freshDb("c13")
   const t = claim(db, "disable VOX25 DHCP", "ses_A")
-  const bad = PM.preflight(db, { task: "compile a rust program for the embedded target", claim: true, ownerSession: "ses_B", projectDir: dir, fts, reclaimTicket: t, reclaimOwner: "ses_A" })
-  check("C13 mismatched reclaim denied", !!(bad as any).reclaim_error, JSON.stringify(bad))
   const good = PM.preflight(db, { task: "disable VOX25 DHCP", claim: true, ownerSession: "ses_B", projectDir: dir, fts, reclaimTicket: t, reclaimOwner: "ses_A" })
   check("C13 correct reclaim → NEW same ticket", good.status === "NEW" && good.ticket === t && good.owner_session === "ses_B", JSON.stringify(good))
+  const stale = PM.preflight(db, { task: "disable VOX25 DHCP", claim: true, ownerSession: "ses_C", projectDir: dir, fts, reclaimTicket: t, reclaimOwner: "ses_A" })
+  check("C13 stale-owner CAS denied", !!(stale as any).reclaim_error, JSON.stringify(stale))
+  const row = db.query("SELECT * FROM work_items WHERE id=?").get(t) as any
+  check("C13 row still owned by ses_B", row.owner_session === "ses_B", JSON.stringify(row))
   check("C13 single row", (db.query("SELECT COUNT(*) AS n FROM work_items WHERE canonical_key='disable vox25 dhcp'").get() as any).n === 1)
 }
 

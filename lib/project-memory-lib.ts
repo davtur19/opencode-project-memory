@@ -44,6 +44,10 @@ export function compactRef(s: string, budget: number = REF_BUDGET): string {
 }
 
 // ---------- schema ----------
+// facts and worker_session are legacy columns kept for compatibility with
+// existing DBs. facts is never read (removed from the public work_save API) and
+// worker_session is no longer written by runtime scheduling logic; both remain
+// in the schema so existing databases open without a destructive migration.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS work_items (
   id TEXT PRIMARY KEY,
@@ -123,6 +127,8 @@ export function openMemory(dbPath: string): Database {
 }
 
 // ---------- schema migration (adds 'failed' status + reclaimed_at column, then worker_session column) ----------
+// Non-destructive and additive only: existing rows are preserved, and re-opening
+// a historical DB never drops or rewrites work items.
 export function migrateSchema(db: Database): void {
   db.exec("PRAGMA foreign_keys=OFF")
   try {
@@ -144,7 +150,8 @@ export function migrateSchema(db: Database): void {
   // worker_session column: added by this plugin version. Fresh DBs already have
   // it via SCHEMA; DBs migrated by an older plugin version (has 'failed' but no
   // worker_session) get the column added in place. Idempotent: re-running finds
-  // the column present and does nothing.
+  // the column present and does nothing. Kept only for DB compatibility — the
+  // plugin no longer writes it.
   const cols = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name)
   if (!cols.includes("worker_session")) {
     db.exec("ALTER TABLE work_items ADD COLUMN worker_session TEXT")
@@ -227,7 +234,6 @@ export function ensureScratch(base: string, ticket: string): string {
 }
 
 // ---------- helpers ----------
-function stripMarkdown(s: string): string { return s.replace(/\*\*/g, "").replace(/`/g, "").trim() }
 function evidenceFor(db: Database, itemId: string): string[] {
   return (db.query("SELECT path FROM evidence WHERE work_item_id=?").all(itemId) as { path: string }[]).map((r) => r.path)
 }
@@ -236,53 +242,18 @@ function ftsQuery(key: string): string {
   if (toks.length === 0) return '""'
   return toks.map((t) => `"${t}"`).join(" OR ")
 }
+
+// Markdown retrieval feeds read_first ONLY (bounded). When FTS5 is unavailable
+// this path safely returns no Markdown matches — it never falls back to LIKE on
+// a table that may not exist.
 function readFirstFor(db: Database, key: string, fts: boolean): string[] {
-  if (fts) {
+  if (!fts) return []
+  try {
     return (db.query("SELECT path FROM markdown_fts WHERE markdown_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)) as { path: string }[]).map((r) => r.path)
+  } catch {
+    return []
   }
-  return (db.query("SELECT path FROM markdown_fts WHERE path LIKE ? OR title LIKE ? LIMIT 6").all(`%${key}%`, `%${key}%`) as { path: string }[]).map((r) => r.path)
 }
-
-// ---------- semantic continuation gate ----------
-// An active (in_progress) ticket found only via the loose FTS candidate list
-// may be reused ONLY when there is a real task correspondence: at least
-// MIN_SEMANTIC_OVERLAP significant shared tokens between the request key and
-// the candidate's stored text. FTS candidate membership alone (any single
-// shared token, e.g. "local") must never be enough — regression: an unrelated
-// active ticket was repeatedly returned for a different task.
-// Threshold 3 (not 2): two shared significant tokens are NEVER enough to prove
-// a continuation — e.g. "fix local project" vs "inspect local project" share
-// {local, project} but are different tasks. Requiring >= 3 distinct significant
-// shared tokens makes that false positive structurally impossible.
-const MIN_SEMANTIC_OVERLAP = 3
-const STOPWORDS = new Set([
-  "a","an","and","are","as","at","be","been","by","for","from","in","into","is","it",
-  "of","on","or","that","the","to","was","were","will","with","do","does","did","have",
-  "has","had","not","but","this","these","those","its","our","your","their","we","you",
-  "they","he","she","i","me","my","him","her","us","them","then","than","so","if",
-  "while","when","where","which","who","whom","what","why","how","all","any","both",
-  "each","few","more","most","other","some","such","no","nor","only","own","same",
-  "too","very","just","also","even",
-  "di","da","e","a","il","la","le","i","gli","lo","un","una","uno","del","della","dei",
-  "delle","nel","nella","nei","nelle","con","su","per","che","chi","cui","piu","meno",
-  "non","si","se","quando","dove","come","cosa","questo","questa","questi","queste",
-  "quello","quella","quelli","quelle",
-])
-function sigTokens(s: string): Set<string> {
-  const out = new Set<string>()
-  for (const t of normalizeKey(s).split(" ").filter(Boolean)) {
-    if (t.length >= 3 && !STOPWORDS.has(t)) out.add(t)
-  }
-  return out
-}
-function tokenOverlap(a: string, b: string): number {
-  const sa = sigTokens(a)
-  const sb = sigTokens(b)
-  let n = 0
-  for (const t of sa) if (sb.has(t)) n++
-  return n
-}
-
 
 export function maybeSyncFts(db: Database, fts: boolean) {
   if (!fts) return
@@ -310,15 +281,13 @@ export type ReclaimResult =
 // on reclaimed_at), SUCCESSIVE reclaims of repeated orphans are allowed: orphan
 // → reclaim → new orphan → reclaim again works. reclaimed_at is pure audit
 // (timestamp of the last reclaim), never a gate.
-export function reclaimWorkItem(db: Database, opts: { ticket: string; task: string; ownerSession: string; previousOwner: string }): ReclaimResult {
+// Reclaim relies on the explicit ticket + observed-owner CAS only — the request
+// text is NOT gated against the stored ticket (the caller is responsible for
+// passing the correct ticket from the IN_PROGRESS preflight result).
+export function reclaimWorkItem(db: Database, opts: { ticket: string; ownerSession: string; previousOwner: string }): ReclaimResult {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
   if (!item) return { ok: false, reason: `ticket not found: ${opts.ticket}` }
   if (item.status !== "in_progress") return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${item.status})` }
-  const key = normalizeKey(opts.task)
-  const overlap = tokenOverlap(key, `${item.canonical_key} ${item.summary} ${item.unresolved}`)
-  if (key !== item.canonical_key && overlap < MIN_SEMANTIC_OVERLAP) {
-    return { ok: false, reason: `reclaim denied: requested work does not correspond to ticket ${opts.ticket} (ref=${compactRef(item.canonical_key)}, overlap=${overlap})` }
-  }
   const now = nowIso()
   const historyNote = `[reclaim] ${now} from ${item.owner_session ?? "none"} to ${opts.ownerSession}`
   const notes = [item.notes, historyNote].filter(Boolean).join("\n")
@@ -342,13 +311,10 @@ export type PreflightResult = {
   status: PreflightStatus
   ticket?: string
   match_reason?: string
-  match_score?: number
   // Provenance when the matched stored item's canonical text differs from the
   // normalized request: its ticket + a bounded reference. Omitted when the
   // matched item IS the requested work (ticket already identifies it).
   matched?: { ticket: string; ref: string }
-  reuse_denied?: { id: string; ref: string; overlap: number }[]
-  reuse_considered?: { id: string; ref: string; overlap: number; selected: boolean }[]
   established: string[]
   do_not_repeat: string[]
   unresolved: string[]
@@ -356,8 +322,6 @@ export type PreflightResult = {
   read_first: string[]
   scratch?: string
   owner_session?: string
-  next_action?: "DELEGATE" | "DELEGATE_DELTA" | "USE_EXISTING" | "STEER" | "WAIT"
-  worker_session?: string
   reclaimed?: { previous_owner: string | null; reclaimed_at: string }
   reclaim_error?: string
   candidates: CandidateRef[]
@@ -370,10 +334,6 @@ function matchedOf(item: WorkItem, key: string): { ticket: string; ref: string }
   return { ticket: item.id, ref: compactRef(item.canonical_key) }
 }
 
-function recordLastPreflight(db: Database, sessionID: string, res: PreflightResult) {
-  db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [`last_preflight:${sessionID}`, JSON.stringify({ status: res.status, next_action: res.next_action ?? null, ticket: res.ticket ?? null })])
-}
-
 export function preflight(db: Database, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean; reclaimTicket?: string; reclaimOwner?: string }): PreflightResult {
   let res: PreflightResult
   if (opts.reclaimTicket) {
@@ -381,7 +341,7 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
       res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts })
       res = { ...res, reclaim_error: "reclaim_owner is required: pass the owner_session observed in the IN_PROGRESS preflight result" }
     } else {
-      const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, task: opts.task, ownerSession: opts.ownerSession, previousOwner: opts.reclaimOwner })
+      const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, ownerSession: opts.ownerSession, previousOwner: opts.reclaimOwner })
       if (r.ok) {
         const key = normalizeKey(opts.task)
         const readFirst = readFirstFor(db, key, opts.fts)
@@ -389,7 +349,7 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
         // Reclaim = the SAME unresolved work continues under a new owner; nothing
         // about it is newly established. The stored unresolved text (or, if empty,
         // the caller's request) is the remaining work — never an established fact.
-        res = { status: "NEW", ticket: r.item.id, match_reason: "reclaimed", established: [], do_not_repeat: [], unresolved: r.item.unresolved ? [r.item.unresolved] : [opts.task], evidence: evidenceFor(db, r.item.id).slice(0, 10), read_first: readFirst, scratch: sc, owner_session: opts.ownerSession, candidates: [], reclaimed: { previous_owner: r.previous_owner, reclaimed_at: r.reclaimed_at }, next_action: "DELEGATE" }
+        res = { status: "NEW", ticket: r.item.id, match_reason: "reclaimed", established: [], do_not_repeat: [], unresolved: r.item.unresolved ? [r.item.unresolved] : [opts.task], evidence: evidenceFor(db, r.item.id).slice(0, 10), read_first: readFirst, scratch: sc, owner_session: opts.ownerSession, candidates: [], reclaimed: { previous_owner: r.previous_owner, reclaimed_at: r.reclaimed_at } }
       } else {
         res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts })
         res = { ...res, reclaim_error: r.reason }
@@ -398,17 +358,7 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
   } else {
     res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts })
   }
-  recordLastPreflight(db, opts.ownerSession, res)
   return res
-}
-
-// What an orchestrator should do about an IN_PROGRESS ticket: STEER when a worker
-// is already bound, WAIT when another session owns the claim (still running),
-// DELEGATE when the current session owns the claim but no worker was spawned yet.
-function inProgressAction(item: WorkItem, currentSession: string): "STEER" | "WAIT" | "DELEGATE" {
-  if (item.worker_session) return "STEER"
-  if (item.owner_session && item.owner_session !== currentSession) return "WAIT"
-  return "DELEGATE"
 }
 
 export function preflightCore(db: Database, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean }): PreflightResult {
@@ -429,6 +379,10 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
       if (item) matchSrc = "fail-id"
     }
   }
+  // FTS candidates are RELATED CONTEXT ONLY. A loose FTS match never identifies
+  // the request: it cannot turn another active (in_progress) item into
+  // IN_PROGRESS and never claims on behalf of an active item. Only completed
+  // (done/covered/blocked) candidates feed PARTIAL context.
   let candidates: (WorkItem & { fts_rank?: number })[] = []
   if (fts) {
     candidates = db.query("SELECT w.*, f.rank AS fts_rank FROM memory_fts f JOIN work_items w ON w.rowid=f.rowid WHERE memory_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)) as (WorkItem & { fts_rank?: number })[]
@@ -442,43 +396,26 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
 
   if (item) {
     if (item.status === "in_progress") {
-      return { status: "IN_PROGRESS", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], owner_session: item.owner_session ?? undefined, next_action: inProgressAction(item, opts.ownerSession), worker_session: item.worker_session ?? undefined }
+      return { status: "IN_PROGRESS", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], owner_session: item.owner_session ?? undefined }
     }
     if (item.status === "done" || item.status === "covered" || item.status === "blocked") {
       const unresolved = item.unresolved ? [item.unresolved] : []
       if (item.status === "blocked") unresolved.unshift(`BLOCKED: ${item.summary}`)
-      return { status: "COVERED", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${compactRef(item.canonical_key)} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], next_action: "USE_EXISTING" }
+      return { status: "COVERED", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${compactRef(item.canonical_key)} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
     }
     // status 'new' / 'failed' → claimable
     if (opts.claim) {
       const priorNote = item.status === "failed" ? "prior failed attempt: " + [item.summary, item.notes].filter(Boolean).join(" | ") : ""
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: priorNote, ownerSession: opts.ownerSession, source: "agent" })
-      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], next_action: "DELEGATE" } }
-      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined }
+      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] } }
+      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined }
     }
-    return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], next_action: "DELEGATE" }
+    return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] }
   }
 
-  // Semantic continuation gate: reuse an active ticket ONLY when it really
-  // corresponds to the requested task. FTS candidate membership alone (any
-  // single shared token) is never sufficient: a continuation needs at least
-  // MIN_SEMANTIC_OVERLAP distinct significant shared tokens. Every in_progress
-  // candidate is scored and the BEST one is gated — the decision must not
-  // depend on the arbitrary order of the candidates array.
-  let reuseDenied: { id: string; ref: string; overlap: number }[] = []
-  let reuseConsidered: { id: string; ref: string; overlap: number; selected: boolean }[] = []
-  const inProgressCandidates = candidates.filter((c) => c.status === "in_progress")
-  if (inProgressCandidates.length > 0) {
-    const scored = inProgressCandidates.map((c) => ({ c, overlap: tokenOverlap(key, `${c.canonical_key} ${c.summary} ${c.unresolved}`) }))
-    const best = scored.reduce((a, b) => (b.overlap > a.overlap || (b.overlap === a.overlap && (b.c.fts_rank ?? 0) < (a.c.fts_rank ?? 0)) ? b : a))
-    reuseConsidered = scored.map(({ c, overlap }) => ({ id: c.id, ref: compactRef(c.canonical_key), overlap, selected: c.id === best.c.id }))
-    if (best.overlap >= MIN_SEMANTIC_OVERLAP) {
-      const c = best.c
-      return { status: "IN_PROGRESS", ticket: c.id, match_reason: "semantic-continuation", match_score: best.overlap, matched: matchedOf(c, key), established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered, owner_session: c.owner_session ?? undefined, next_action: inProgressAction(c, opts.ownerSession), worker_session: c.worker_session ?? undefined }
-    }
-    reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, ref: compactRef(c.canonical_key), overlap }))
-  }
-
+  // No exact/alias/fail-id match. Completed FTS candidates supply PARTIAL
+  // context: previously persisted facts only (summaries), never the requested
+  // work. In_progress candidates are ignored entirely.
   const doneCandidates = candidates.filter((c) => c.status === "done" || c.status === "covered" || c.status === "blocked")
   if (doneCandidates.length > 0) {
     // established = previously persisted facts only: the recorded summaries of
@@ -491,22 +428,24 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
     const cand = doneCandidates.map((c) => ({ ticket: c.id, ref: compactRef(c.canonical_key), status: c.status }))
     if (opts.claim) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: `delta of ${doneCandidates[0].canonical_key}`, ownerSession: opts.ownerSession, parentKey: doneCandidates[0].canonical_key, source: "agent" })
-      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "PARTIAL", ticket: c.item.id, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE_DELTA" } }
-      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined }
+      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "PARTIAL", ticket: c.item.id, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand } }
+      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, owner_session: c.inProgress.owner_session ?? undefined }
     }
-    return { status: "PARTIAL", match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE_DELTA" }
+    return { status: "PARTIAL", match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand }
   }
 
   // NEW
   if (opts.claim) {
     const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" })
-    if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE" } }
-    return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined }
+    if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] } }
+    return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined }
   }
-  return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE" }
+  return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] }
 }
 // ---------- record ----------
-export function recordResult(db: Database, opts: { ticket: string; status: string; summary?: string; unresolved?: string; evidence?: string[]; facts?: { key: string; value: string }[] }): { ok: true; item: WorkItem } | { ok: false; reason: string } {
+// facts is deliberately not part of this API: it was written but never
+// retrieved. The legacy facts table remains in the schema for compatibility.
+export function recordResult(db: Database, opts: { ticket: string; status: string; summary?: string; unresolved?: string; evidence?: string[] }): { ok: true; item: WorkItem } | { ok: false; reason: string } {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
   if (!item) return { ok: false, reason: `ticket not found: ${opts.ticket}` }
   const now = nowIso()
@@ -515,9 +454,6 @@ export function recordResult(db: Database, opts: { ticket: string; status: strin
   for (const p of opts.evidence ?? []) {
     const exists = db.query("SELECT 1 FROM evidence WHERE work_item_id=? AND path=?").get(opts.ticket, p)
     if (!exists) db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [opts.ticket, p, "file", ""])
-  }
-  for (const f of opts.facts ?? []) {
-    db.run("INSERT INTO facts (key, value, source, updated_at) VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, source=excluded.source, updated_at=excluded.updated_at", [f.key, f.value, `ticket:${opts.ticket}`, now])
   }
   return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem }
 }
@@ -543,130 +479,17 @@ export function appendFailure(db: Database, opts: { projectDir: string; symptom:
   return { id, path: file }
 }
 
-// ---------- goal checkpoint (atomic single-writer, managed section) ----------
-const GOAL_START = "<!-- PROJECT-MEMORY:CURRENT-START -->"
-const GOAL_END = "<!-- PROJECT-MEMORY:CURRENT-END -->"
-
-export function checkpointGoal(projectDir: string, content: string): { path: string; bytes: number } {
-  const dir = path.join(projectDir, ".opencode")
-  fs.mkdirSync(dir, { recursive: true })
-  const file = path.join(dir, "goal-state.md")
-  let existing = ""
-  if (fs.existsSync(file)) existing = fs.readFileSync(file, "utf8")
-  const s = existing.indexOf(GOAL_START)
-  const e = existing.indexOf(GOAL_END)
-  let next: string
-  if (s === -1 || e === -1 || e < s) {
-    const sep = existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""
-    next = existing + sep + GOAL_START + "\n" + content + "\n" + GOAL_END + "\n"
-  } else {
-    next = existing.slice(0, s + GOAL_START.length) + "\n" + content + "\n" + existing.slice(e)
-  }
-  const tmp = path.join(dir, `.goal-state.md.tmp-${process.pid}`)
-  fs.writeFileSync(tmp, next, "utf8")
-  fs.renameSync(tmp, file)
-  return { path: file, bytes: Buffer.byteLength(next) }
-}
-
-// ---------- bootstrap (non-destructive importer) ----------
-function mapStatus(statoLine: string): string {
-  const s = statoLine.toLowerCase()
-  if (s.includes("bloccato")) return "blocked"
-  if (s.includes("dead")) return "done"
-  if (s.includes("fatto")) return "done"
-  return "new"
-}
-
-function importVectors(db: Database, file: string) {
-  const content = fs.readFileSync(file, "utf8")
-  const sections: { title: string; lines: string[] }[] = []
-  let current: { title: string; lines: string[] } | null = null
-  for (const line of content.split("\n")) {
-    if (line.startsWith("### ")) { current = { title: line.slice(4).trim(), lines: [] }; sections.push(current) }
-    else if (current) current.lines.push(line)
-  }
-  for (const s of sections) {
-    const key = normalizeKey(s.title.split("(")[0])
-    const stato = s.lines.find((l) => l.includes("**Stato**")) ?? ""
-    const sintesi = s.lines.find((l) => l.includes("**Sintesi**")) ?? ""
-    const evidenza = s.lines.find((l) => l.includes("**Evidenza**")) ?? ""
-    const nonRipetere = s.lines.find((l) => l.includes("**NON ripetere**")) ?? ""
-    const riap = s.lines.find((l) => l.includes("**Riapertura**")) ?? ""
-    const status = mapStatus(stato)
-    const summary = stripMarkdown(sintesi.replace(/^.*?\*\*Sintesi\*\*\s*:?\s*/, "")).slice(0, 500)
-    const notes = [
-      nonRipetere ? `NON RIPETERE: ${stripMarkdown(nonRipetere.replace(/^.*?\*\*NON ripetere\*\*\s*:?\s*/, "")).slice(0, 500)}` : "",
-      riap ? `Riapertura: ${stripMarkdown(riap.replace(/^.*?\*\*Riapertura\*\*\s*:?\s*/, "")).slice(0, 300)}` : "",
-    ].filter(Boolean).join("\n")
-    const unresolved = riap ? stripMarkdown(riap.replace(/^.*?\*\*Riapertura\*\*\s*:?\s*/, "")).slice(0, 300) : ""
-    const id = ulid()
-    const now = nowIso()
-    db.run("INSERT INTO work_items (id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at) VALUES (?,?,?,?,?,?,NULL,NULL,'bootstrap:VECTORS.md',?,?)", [id, key, status, summary, unresolved, notes, now, now])
-    db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [id, normalizeKey(s.title)])
-    db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, file, "vectors", s.title])
-    const all = s.lines.join("\n")
-    for (const m of all.matchAll(/FAIL-\d+/g)) {
-      db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [id, normalizeKey(m[0])])
-      db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, m[0], "fail", ""])
-    }
-    for (const m of all.matchAll(/report_[a-z0-9_]+\.md/g)) {
-      db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, m[0], "report", ""])
-    }
-  }
-}
-
-function importFailures(db: Database, file: string) {
-  const content = fs.readFileSync(file, "utf8")
-  const sections: { title: string; lines: string[] }[] = []
-  let current: { title: string; lines: string[] } | null = null
-  for (const line of content.split("\n")) {
-    if (line.startsWith("## ")) { current = { title: line.slice(3).trim(), lines: [] }; sections.push(current) }
-    else if (current) current.lines.push(line)
-  }
-  for (const s of sections) {
-    const m = s.title.match(/FAIL-\d+/i)
-    if (!m) continue
-    const key = normalizeKey(m[0])
-    const first = s.lines.find((l) => l.trim().length > 0) ?? ""
-    const summary = stripMarkdown(first).slice(0, 300)
-    const now = nowIso()
-    const existing = db.query("SELECT * FROM work_items WHERE canonical_key=?").get(key) as WorkItem | undefined
-    if (existing) {
-      db.run("UPDATE work_items SET summary=?, updated_at=? WHERE id=?", [summary || existing.summary, now, existing.id])
-      db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [existing.id, file, "failures", s.title])
-    } else {
-      const id = ulid()
-      db.run("INSERT INTO work_items (id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at) VALUES (?,?,'done',?,'','',NULL,NULL,'bootstrap:FAILURES.md',?,?)", [id, key, summary, now, now])
-      db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [id, key])
-      db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, file, "failures", s.title])
-    }
-  }
-}
-
-function importReportsIndex(db: Database, file: string, projectDir: string) {
-  const content = fs.readFileSync(file, "utf8")
-  for (const line of content.split("\n")) {
-    const m = line.match(/^\|\s*(report_[a-z0-9_]+\.md)\s*\|\s*(.*?)\s*\|\s*(\w+)\s*\|/)
-    if (!m) continue
-    const report = m[1]
-    const sintesi = m[2]
-    const stato = m[3].toLowerCase()
-    const key = normalizeKey(report.replace(/\.md$/, ""))
-    const status = stato.includes("fatto") || stato.includes("dead") ? "done" : "new"
-    const id = ulid()
-    const now = nowIso()
-    db.run("INSERT INTO work_items (id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at) VALUES (?,?,?,?,'','',NULL,NULL,'bootstrap:REPORTS_INDEX.md',?,?)", [id, key, status, sintesi.slice(0, 300), now, now])
-    db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [id, normalizeKey(report)])
-    db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [id, path.join(projectDir, ".opencode", report), "report", ""])
-  }
-}
-
+// ---------- bootstrap (Markdown index for read_first ONLY) ----------
+// No automatic legacy Markdown → work_item import. Previously imported rows
+// (source='bootstrap:%') are never deleted or rewritten; existing DBs keep
+// their historical work items untouched. Markdown files are indexed into
+// markdown_fts solely to support the bounded read_first retrieval in preflight.
+// When FTS5 is unavailable this path safely does nothing (read_first returns []).
 export function bootstrap(db: Database, projectDir: string, fts: boolean): { imported: number; sources: string[] } {
+  if (!fts) return { imported: 0, sources: [] }
   const dir = path.join(projectDir, ".opencode")
   const sources: string[] = []
-  const tx = db.transaction(() => {
-    const prev = db.query("SELECT id FROM work_items WHERE source LIKE 'bootstrap:%'").all() as { id: string }[]
-    for (const r of prev) db.run("DELETE FROM work_items WHERE id=?", [r.id])
+  db.transaction(() => {
     db.exec("DELETE FROM markdown_fts")
     const mdFiles: string[] = []
     if (fs.existsSync(dir)) {
@@ -683,55 +506,9 @@ export function bootstrap(db: Database, projectDir: string, fts: boolean): { imp
         sources.push(f)
       } catch {}
     }
-    const vectors = path.join(dir, "VECTORS.md")
-    if (fs.existsSync(vectors)) importVectors(db, vectors)
-    const failures = path.join(dir, "FAILURES.md")
-    if (fs.existsSync(failures)) importFailures(db, failures)
-    const reportsIndex = path.join(dir, "REPORTS_INDEX.md")
-    if (fs.existsSync(reportsIndex)) importReportsIndex(db, reportsIndex, projectDir)
-    const goalState = path.join(dir, "goal-state.md")
-    if (fs.existsSync(goalState)) {
-      const content = fs.readFileSync(goalState, "utf8")
-      db.run("INSERT INTO facts (key, value, source, updated_at) VALUES ('goal-state', ?, 'bootstrap', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, source=excluded.source, updated_at=excluded.updated_at", [content.slice(0, 100000), nowIso()])
-    }
-  })
-  tx()
+  })()
   syncAllFts(db, fts)
-  const n = (db.query("SELECT COUNT(*) AS n FROM work_items WHERE source LIKE 'bootstrap:%'").get() as { n: number }).n
-  return { imported: n, sources }
-}
-
-// ---------- gate ----------
-export type GateDecision = { action: "allow" | "block" | "warn"; reason?: string; ticket?: string }
-export function gateDecision(db: Database, opts: { sessionID: string; args: { task_id?: string; subagent_type?: string } }): GateDecision {
-  const args = opts.args ?? {}
-  if (args.task_id) return { action: "allow", reason: "steering" }
-  const st = args.subagent_type
-  if (st === "vision" || st === "verifier") return { action: "allow", reason: `exempt: ${st}` }
-  const claim = db.query("SELECT * FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1").get(opts.sessionID) as WorkItem | undefined
-  if (claim) {
-    if (claim.worker_session) {
-      return { action: "block", reason: "project-memory gate: a worker is already delegated for this work (session " + claim.worker_session + "). Do not retry task() — steer the existing worker via task_id, or reclaim only if orphaned. (Set PROJECT_MEMORY_GATE=warn to relax.)" }
-    }
-    return { action: "allow", reason: "preflight ticket", ticket: claim.id }
-  }
-  const lastRaw = (db.query("SELECT value FROM meta WHERE key=?").get(`last_preflight:${opts.sessionID}`) as { value: string } | undefined)?.value
-  let last: { status?: string; next_action?: string } | undefined
-  if (lastRaw) { try { last = JSON.parse(lastRaw) } catch { last = undefined } }
-  if (last?.status === "IN_PROGRESS") {
-    return { action: "block", reason: "project-memory gate: this work is already in progress. Do not retry task(). Follow next_action from project_work_check (" + (last.next_action ?? "WAIT") + "), or reclaim only if orphaned. (Set PROJECT_MEMORY_GATE=warn to relax.)" }
-  }
-  return { action: "block", reason: "project-memory gate: no valid project_work_check for this session. Run project_work_check(work=...) before delegating. (Set PROJECT_MEMORY_GATE=warn to relax.)" }
-}
-
-// ---------- claim → child session binding (for steering via task_id) ----------
-// Records the child as the WORKER of the parent's most recent in_progress claim.
-// The parent KEEPS the claim (owner_session unchanged) so the orchestrator can
-// delegate again later; the child session id is recorded in worker_session for
-// steering/audit. Before this change ownership was TRANSFERRED to the child,
-// which broke every subsequent task() for the parent (gate had no claim left).
-export function bindClaimToChild(db: Database, parentID: string, childSessionID: string) {
-  db.run("UPDATE work_items SET worker_session=?, updated_at=? WHERE id=(SELECT id FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1)", [childSessionID, nowIso(), parentID])
+  return { imported: 0, sources }
 }
 
 // ---------- fail-closed memory access (recovery + MEMORY_ERROR) ----------
@@ -808,18 +585,5 @@ export function preflightSafe(handle: MemoryHandle, opts: { task: string; claim:
   } catch (e: any) {
     const cause = e instanceof MemoryError ? (e.cause !== undefined ? String(e.cause) : e.message) : String(e?.message ?? e)
     return { handle, result: { status: "MEMORY_ERROR", canonical_key: key, error: { message: "project memory preflight unavailable or inconclusive", cause } } }
-  }
-}
-
-export function gateSafe(handle: MemoryHandle, opts: { sessionID: string; args: { task_id?: string; subagent_type?: string } }): { handle: MemoryHandle; decision: GateDecision } {
-  const args = opts.args ?? {}
-  if (args.task_id) return { handle, decision: { action: "allow", reason: "steering" } }
-  const st = args.subagent_type
-  if (st === "vision" || st === "verifier") return { handle, decision: { action: "allow", reason: `exempt: ${st}` } }
-  try {
-    const { handle: h, value } = runWithRecovery(handle, (db) => gateDecision(db, opts))
-    return { handle: h, decision: value }
-  } catch {
-    return { handle, decision: { action: "block", reason: "Project memory preflight is unavailable or inconclusive. Delegation blocked to avoid repeating or conflicting work." } }
   }
 }

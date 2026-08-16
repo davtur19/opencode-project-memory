@@ -108,34 +108,24 @@ function resolveIdea(db: Database, ref: string): { id: string; canonical_key: st
   return null
 }
 
-// Resolve a relation target. Prefixed "idea:KEY"/"condition:KEY" auto-create a
-// placeholder when missing (unless autoCreate=false, used by remove_relations).
-// Bare targets: exact id/key lookup across ideas then conditions; never auto-created.
-function resolveTarget(db: Database, target: string, autoCreate: boolean): { target_type: "idea" | "condition"; target_id: string; target_key: string } | null {
+// Resolve a relation target to an EXISTING idea/condition only. Never creates
+// placeholder ideas or conditions for missing relation targets: a target that
+// does not resolve is a validation error, not an implicit insertion. Prefixed
+// "idea:KEY"/"condition:KEY" resolve by normalized key; bare targets resolve by
+// exact id then key across ideas then conditions.
+function resolveTarget(db: Database, target: string): { target_type: "idea" | "condition"; target_id: string; target_key: string } | null {
   if (typeof target !== "string" || !target) return null
   if (target.startsWith("condition:")) {
     const k = normalizeKey(target.slice("condition:".length))
     if (!k) return null
-    let row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k) as ConditionRow | undefined
-    if (!row && autoCreate) {
-      const id = ulid()
-      const now = nowIso()
-      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,0,'',?,?)", [id, k, k, now, now])
-      row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k) as ConditionRow
-    }
+    const row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k) as ConditionRow | undefined
     if (!row) return null
     return { target_type: "condition", target_id: row.id, target_key: row.canonical_key }
   }
   if (target.startsWith("idea:")) {
     const k = normalizeKey(target.slice("idea:".length))
     if (!k) return null
-    let row = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(k) as IdeaRow | undefined
-    if (!row && autoCreate) {
-      const id = ulid()
-      const now = nowIso()
-      db.run("INSERT INTO ideas (id, canonical_key, title, summary, status, rationale, evidence, created_at, updated_at) VALUES (?,?,?,?,'proposed','','',?,?)", [id, k, k, "", now, now])
-      row = db.query("SELECT * FROM ideas WHERE id=?").get(id) as IdeaRow
-    }
+    const row = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(k) as IdeaRow | undefined
     if (!row) return null
     return { target_type: "idea", target_id: row.id, target_key: row.canonical_key }
   }
@@ -179,15 +169,16 @@ export function derivedStateFor(db: Database, ideaId: string): { derived: string
   return { derived: blockers.length ? "blocked" : "ready", blockers }
 }
 
-// ---------- ideaRecord (persistence) ----------
+// ---------- ideaRecord (validation-first, atomic persistence) ----------
 export type IdeaRecordOpts = {
   idea?: {
     key?: string; id?: string; title?: string; summary?: string; status?: string;
     rationale?: string; evidence?: string
   }
-  // top-level convenience fields (the spec's e2e calls pass status at top level);
-  // merged into `idea` when the corresponding idea field is not set
+  // top-level convenience fields (the spec's e2e calls pass status/evidence at
+  // top level); merged into `idea` when the corresponding idea field is not set
   status?: string
+  evidence?: string
   conditions?: { key: string; description?: string; satisfied?: boolean; satisfied_by?: string }[]
   relations?: { idea: string; kind: string; target: string; note?: string }[]
   satisfies?: string[]
@@ -197,20 +188,31 @@ export type IdeaRecordOpts = {
 export type IdeaRecordResult = {
   ok: boolean
   error?: string
+  errors?: string[]
   idea?: {
     id: string; key: string; title: string; summary: string; status: string; rationale: string;
     evidence: string; created_at: string; updated_at: string; derived: string; blockers: Blocker[]
   }
   conditions?: { key: string; description: string; satisfied: boolean; satisfied_by: string }[]
   relations?: { idea: string; kind: string; target: string }[]
-  errors?: string[]
   removed_relations?: number
+}
+
+type ValidatedSpec = {
+  ideaId: string
+  ideaKey: string
+  kind: string
+  targetType: "idea" | "condition"
+  targetId: string
+  targetKey: string
+  note?: string
 }
 
 export function ideaRecord(db: Database, opts: IdeaRecordOpts = {}): IdeaRecordResult {
   const errors: string[] = []
   const ideaOpts = { ...(opts.idea ?? {}) } as { key?: string; id?: string; title?: string; summary?: string; status?: string; rationale?: string; evidence?: string }
   if (opts.status !== undefined && ideaOpts.status === undefined) ideaOpts.status = opts.status
+  if (opts.evidence !== undefined && ideaOpts.evidence === undefined) ideaOpts.evidence = opts.evidence
 
   // 1. resolve/validate the idea identity — hard precondition
   const hasId = typeof ideaOpts.id === "string" && ideaOpts.id.length > 0
@@ -225,30 +227,119 @@ export function ideaRecord(db: Database, opts: IdeaRecordOpts = {}): IdeaRecordR
     if (!key) return { ok: false, error: "idea.key or idea.id required" }
     existingRow = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(key) as IdeaRow | undefined
   }
+  // The idea id is fixed up front so same-call relations can reference this idea
+  // as their source (the idea being created/updated in this call).
+  const ideaId = existingRow?.id ?? ulid()
 
-  // validate status (if provided)
+  // 2. validate status and evidence rules against the EFFECTIVE final state
+  //    (what the idea will look like after this call applies)
   let statusProvided = false
+  let status = existingRow?.status ?? "proposed"
   if (typeof ideaOpts.status === "string" && ideaOpts.status !== "") {
-    if ((IDEA_STATUSES as readonly string[]).includes(ideaOpts.status)) statusProvided = true
+    if ((IDEA_STATUSES as readonly string[]).includes(ideaOpts.status)) { statusProvided = true; status = ideaOpts.status }
     else errors.push(`invalid idea status '${ideaOpts.status}' (expected one of: ${IDEA_STATUSES.join(", ")})`)
   }
+  const evidence = typeof ideaOpts.evidence === "string" ? ideaOpts.evidence : (existingRow?.evidence ?? "")
+  if (status === "validated" || status === "disproven") {
+    if (typeof evidence !== "string" || evidence.trim() === "") {
+      errors.push(`status '${status}' requires non-empty evidence`)
+    }
+  }
 
-  // 2. idea upsert
+  // 3. conditions: keys required; satisfied=true requires explicit provenance
+  type CondSpec = { key: string; description?: string; satisfied?: boolean; satisfied_by?: string }
+  const condSpecs: CondSpec[] = []
+  for (const c of opts.conditions ?? []) {
+    const ckey = normalizeKey(typeof c.key === "string" ? c.key : "")
+    if (!ckey) { errors.push(`condition key required (got ${JSON.stringify(c.key)})`); continue }
+    if (c.satisfied === true && !(typeof c.satisfied_by === "string" && c.satisfied_by.trim() !== "")) {
+      errors.push(`condition '${ckey}' satisfied=true requires satisfied_by (explicit provenance)`)
+    }
+    condSpecs.push({ key: ckey, description: c.description, satisfied: c.satisfied, satisfied_by: c.satisfied_by })
+  }
+
+  // 4. satisfies: only from a validated idea with evidence, against an EXISTING
+  //    condition, recording the idea id as provenance
+  const satisfiesSpecs: string[] = []
+  for (const s of opts.satisfies ?? []) {
+    const skey = normalizeKey(typeof s === "string" ? s : "")
+    if (!skey) { errors.push(`satisfies key required (got ${JSON.stringify(s)})`); continue }
+    const cond = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(skey) as ConditionRow | undefined
+    if (!cond) { errors.push(`satisfies target condition not found: ${skey}`); continue }
+    satisfiesSpecs.push(skey)
+  }
+  if (opts.satisfies?.length) {
+    if (status !== "validated") errors.push("satisfies requires the idea to be validated")
+    if (evidence.trim() === "") errors.push("satisfies requires the idea to carry evidence")
+  }
+
+  // 5. relations: sources and targets must exist (no placeholders), kinds valid.
+  //    The idea being written in this call counts as a valid source.
+  const resolveSource = (ref: string): { id: string; canonical_key: string } | null => {
+    const existing = resolveIdea(db, ref)
+    if (existing) return existing
+    if (typeof ref === "string" && (ref === ideaId || normalizeKey(ref) === key)) return { id: ideaId, canonical_key: key }
+    return null
+  }
+  const relSpecs: ValidatedSpec[] = []
+  for (const r of opts.relations ?? []) {
+    const src = resolveSource(r.idea)
+    if (!src) { errors.push(`relation source idea not found: ${r.idea}`); continue }
+    if (!(RELATION_KINDS as readonly string[]).includes(r.kind)) { errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`); continue }
+    const tr = resolveTarget(db, r.target)
+    if (!tr) { errors.push(`relation target not found: ${r.target}`); continue }
+    relSpecs.push({ ideaId: src.id, ideaKey: src.canonical_key, kind: r.kind, targetType: tr.target_type, targetId: tr.target_id, targetKey: tr.target_key, note: typeof r.note === "string" ? r.note : "" })
+  }
+  const remSpecs: ValidatedSpec[] = []
+  for (const r of opts.remove_relations ?? []) {
+    const src = resolveSource(r.idea)
+    if (!src) { errors.push(`relation source idea not found: ${r.idea}`); continue }
+    if (!(RELATION_KINDS as readonly string[]).includes(r.kind)) { errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`); continue }
+    const tr = resolveTarget(db, r.target)
+    if (!tr) { errors.push(`relation target not found: ${r.target}`); continue }
+    remSpecs.push({ ideaId: src.id, ideaKey: src.canonical_key, kind: r.kind, targetType: tr.target_type, targetId: tr.target_id, targetKey: tr.target_key })
+  }
+
+  // 6. ATOMIC: any validation error => ok:false, nothing written.
+  if (errors.length > 0) {
+    return { ok: false, error: errors.join("; "), errors }
+  }
+
+  // 7. apply all writes in one transaction.
+  try {
+    return db.transaction(() => applyIdeaRecord(db, { ideaId, ideaOpts, key, existingRow, statusProvided, status, evidence, condSpecs, satisfiesSpecs, relSpecs, remSpecs }))()
+  } catch (e: any) {
+    return { ok: false, error: `idea_save failed: ${e?.message ?? e}` }
+  }
+}
+
+function applyIdeaRecord(db: Database, cfg: {
+  ideaId: string
+  ideaOpts: { key?: string; id?: string; title?: string; summary?: string; status?: string; rationale?: string; evidence?: string }
+  key: string
+  existingRow?: IdeaRow
+  statusProvided: boolean
+  status: string
+  evidence: string
+  condSpecs: { key: string; description?: string; satisfied?: boolean; satisfied_by?: string }[]
+  satisfiesSpecs: string[]
+  relSpecs: ValidatedSpec[]
+  remSpecs: ValidatedSpec[]
+}): IdeaRecordResult {
+  const { ideaId, ideaOpts, key, existingRow, statusProvided, status, evidence, condSpecs, satisfiesSpecs, relSpecs, remSpecs } = cfg
   const now = nowIso()
-  const ideaId = existingRow?.id ?? ulid()
+
   if (existingRow) {
-    // UPDATE path: only the caller-provided fields + updated_at change
     const sets: string[] = []
     const vals: any[] = []
     for (const col of ["title", "summary", "rationale", "evidence"] as const) {
       if (typeof ideaOpts[col] === "string") { sets.push(`${col}=?`); vals.push(ideaOpts[col] as string) }
     }
-    if (statusProvided) { sets.push("status=?"); vals.push(ideaOpts.status) }
+    if (statusProvided) { sets.push("status=?"); vals.push(status) }
     sets.push("updated_at=?")
     vals.push(now)
     db.run(`UPDATE ideas SET ${sets.join(", ")} WHERE id=?`, [...vals, existingRow.id])
   } else {
-    // INSERT path: fresh id + canonical_key, caller-provided fields, defaults otherwise
     db.run(
       `INSERT INTO ideas (id, canonical_key, title, summary, status, rationale, evidence, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -256,7 +347,7 @@ export function ideaRecord(db: Database, opts: IdeaRecordOpts = {}): IdeaRecordR
         ideaId, key,
         typeof ideaOpts.title === "string" ? ideaOpts.title : "",
         typeof ideaOpts.summary === "string" ? ideaOpts.summary : "",
-        statusProvided ? ideaOpts.status : "proposed",
+        statusProvided ? status : "proposed",
         typeof ideaOpts.rationale === "string" ? ideaOpts.rationale : "",
         typeof ideaOpts.evidence === "string" ? ideaOpts.evidence : "",
         now, now,
@@ -265,19 +356,16 @@ export function ideaRecord(db: Database, opts: IdeaRecordOpts = {}): IdeaRecordR
   }
   syncIdeaFts(db, ideaId)
 
-  // 3. conditions upsert
   const condTouched = new Map<string, { key: string; description: string; satisfied: boolean; satisfied_by: string }>()
-  for (const c of opts.conditions ?? []) {
-    const ckey = normalizeKey(typeof c.key === "string" ? c.key : "")
-    if (!ckey) { errors.push(`condition key required (got ${JSON.stringify(c.key)})`); continue }
-    const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(ckey) as ConditionRow | undefined
+  for (const c of condSpecs) {
+    const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(c.key) as ConditionRow | undefined
     const cid = existing?.id ?? ulid()
-    const desc = typeof c.description === "string" ? c.description : (existing?.description ?? "")
+    const desc = typeof c.description === "string" ? c.description : (existing?.description ?? c.key)
     let satisfied: number
     let satisfiedBy: string
     if (typeof c.satisfied === "boolean") {
       satisfied = c.satisfied ? 1 : 0
-      satisfiedBy = c.satisfied ? (typeof c.satisfied_by === "string" && c.satisfied_by !== "" ? c.satisfied_by : existing?.satisfied_by ?? "orchestrator") : ""
+      satisfiedBy = c.satisfied ? (typeof c.satisfied_by === "string" ? c.satisfied_by : "") : ""
     } else {
       satisfied = existing?.satisfied ?? 0
       satisfiedBy = existing?.satisfied_by ?? ""
@@ -294,56 +382,33 @@ export function ideaRecord(db: Database, opts: IdeaRecordOpts = {}): IdeaRecordR
     if (existing) {
       db.run(`UPDATE conditions SET ${sets.join(", ")} WHERE id=?`, [...vals, existing.id])
     } else {
-      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?)", [cid, ckey, desc, satisfied, satisfiedBy, now, now])
+      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?)", [cid, c.key, desc, satisfied, satisfiedBy, now, now])
     }
-    condTouched.set(ckey, { key: ckey, description: desc, satisfied: satisfied === 1, satisfied_by: satisfiedBy })
+    condTouched.set(c.key, { key: c.key, description: desc, satisfied: satisfied === 1, satisfied_by: satisfiedBy })
   }
 
-  // 4. satisfies — marks conditions satisfied; the recorded idea (if any) is the satisfier
-  for (const s of opts.satisfies ?? []) {
-    const skey = normalizeKey(typeof s === "string" ? s : "")
-    if (!skey) { errors.push(`satisfies key required (got ${JSON.stringify(s)})`); continue }
+  // satisfies — the recorded idea id is the provenance
+  for (const skey of satisfiesSpecs) {
     const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(skey) as ConditionRow | undefined
-    const cid = existing?.id ?? ulid()
-    // the idea recorded in this call is the satisfier (e.g. the validating test/idea)
-    const satisfiedBy = key
-    const desc = existing?.description ?? skey
-    const now2 = nowIso()
-    if (existing) {
-      db.run("UPDATE conditions SET satisfied=1, satisfied_by=?, updated_at=? WHERE id=?", [satisfiedBy, now2, existing.id])
-    } else {
-      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,1,?,?,?)", [cid, skey, desc, satisfiedBy, now2, now2])
-    }
-    condTouched.set(skey, { key: skey, description: desc, satisfied: true, satisfied_by: satisfiedBy })
+    if (!existing) continue // validated earlier; defensive
+    db.run("UPDATE conditions SET satisfied=1, satisfied_by=?, updated_at=? WHERE id=?", [ideaId, now, existing.id])
+    condTouched.set(skey, { key: skey, description: existing.description, satisfied: true, satisfied_by: ideaId })
   }
 
-  // 5. relations add
   const addedRelations: { idea: string; kind: string; target: string }[] = []
-  for (const r of opts.relations ?? []) {
-    const src = resolveIdea(db, r.idea)
-    if (!src) { errors.push(`relation source idea not found: ${r.idea}`); continue }
-    if (!(RELATION_KINDS as readonly string[]).includes(r.kind)) { errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`); continue }
-    const tr = resolveTarget(db, r.target, true)
-    if (!tr) { errors.push(`relation target not found: ${r.target}`); continue }
-    const res = db.run("INSERT OR IGNORE INTO idea_relations (idea_id, kind, target_type, target_id, note) VALUES (?,?,?,?,?)", [src.id, r.kind, tr.target_type, tr.target_id, typeof r.note === "string" ? r.note : ""])
+  for (const r of relSpecs) {
+    const res = db.run("INSERT OR IGNORE INTO idea_relations (idea_id, kind, target_type, target_id, note) VALUES (?,?,?,?,?)", [r.ideaId, r.kind, r.targetType, r.targetId, r.note ?? ""])
     if (res.changes > 0) {
-      addedRelations.push({ idea: src.canonical_key, kind: r.kind, target: (tr.target_type === "idea" ? "idea:" : "condition:") + tr.target_key })
+      addedRelations.push({ idea: r.ideaKey, kind: r.kind, target: (r.targetType === "idea" ? "idea:" : "condition:") + r.targetKey })
     }
   }
 
-  // 6. remove_relations
   let removedRelations = 0
-  for (const r of opts.remove_relations ?? []) {
-    const src = resolveIdea(db, r.idea)
-    if (!src) { errors.push(`relation source idea not found: ${r.idea}`); continue }
-    if (!(RELATION_KINDS as readonly string[]).includes(r.kind)) { errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`); continue }
-    const tr = resolveTarget(db, r.target, false)
-    if (!tr) { errors.push(`relation target not found: ${r.target}`); continue }
-    const del = db.run("DELETE FROM idea_relations WHERE idea_id=? AND kind=? AND target_type=? AND target_id=?", [src.id, r.kind, tr.target_type, tr.target_id])
+  for (const r of remSpecs) {
+    const del = db.run("DELETE FROM idea_relations WHERE idea_id=? AND kind=? AND target_type=? AND target_id=?", [r.ideaId, r.kind, r.targetType, r.targetId])
     removedRelations += del.changes
   }
 
-  // 8. result (idea row re-read after upsert, derived state computed fresh)
   const finalRow = db.query("SELECT * FROM ideas WHERE id=?").get(ideaId) as IdeaRow
   const d = derivedStateFor(db, ideaId)
   return {
@@ -355,7 +420,6 @@ export function ideaRecord(db: Database, opts: IdeaRecordOpts = {}): IdeaRecordR
     },
     conditions: [...condTouched.values()].slice(0, 20),
     relations: addedRelations.slice(0, 20),
-    errors,
     removed_relations: removedRelations,
   }
 }

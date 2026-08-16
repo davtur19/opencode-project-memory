@@ -29,7 +29,7 @@ r = PM.preflight(db, { task: "analyze widget X", claim: true, ownerSession: "ses
 check("other session → IN_PROGRESS owner", r.status === "IN_PROGRESS" && r.owner_session === "ses_A", JSON.stringify(r))
 
 // 4. record done → COVERED
-let rec = PM.recordResult(db, { ticket: ticket1, status: "done", summary: "widget X analyzed: no vuln", evidence: ["report_widget_x.md"], facts: [{ key: "widget.x", value: "no vuln" }] })
+let rec = PM.recordResult(db, { ticket: ticket1, status: "done", summary: "widget X analyzed: no vuln", evidence: ["report_widget_x.md"] })
 check("record ok", rec.ok, JSON.stringify(rec))
 r = PM.preflight(db, { task: "analyze widget X", claim: true, ownerSession: "ses_C", projectDir: dir, fts })
 check("done → COVERED", r.status === "COVERED", JSON.stringify(r))
@@ -43,45 +43,44 @@ db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?)", [y.id, "wy"])
 r = PM.preflight(db, { task: "wy", claim: false, ownerSession: "ses_A", projectDir: dir, fts })
 check("alias match → IN_PROGRESS", r.status === "IN_PROGRESS", JSON.stringify(r))
 
-// 6. gate
-let g = PM.gateDecision(db, { sessionID: "ses_C", args: { subagent_type: "subagent" } })
-check("gate block (no claim)", g.action === "block", JSON.stringify(g))
-g = PM.gateDecision(db, { sessionID: "ses_C", args: { subagent_type: "vision" } })
-check("gate allow vision", g.action === "allow")
-g = PM.gateDecision(db, { sessionID: "ses_C", args: { task_id: "ses_123" } })
-check("gate allow steering", g.action === "allow")
-g = PM.gateDecision(db, { sessionID: "ses_A", args: { subagent_type: "subagent" } })
-check("gate allow (has claim)", g.action === "allow", JSON.stringify(g))
-
-// 7. failure append
+// 6. failure append
 const f = PM.appendFailure(db, { projectDir: dir, symptom: "s", cause: "c", lesson: "l", topic: "widget X", fts })
 check("failure id format", /^FAIL-\d{8}-[A-Z0-9]{8}$/.test(f.id), f.id)
 check("failure file exists", fs.existsSync(f.path))
 r = PM.preflight(db, { task: "widget X", claim: false, ownerSession: "ses_D", projectDir: dir, fts })
 check("failure topic → COVERED", r.status === "COVERED", JSON.stringify(r))
 
-// 8. goal checkpoint
-const cp = PM.checkpointGoal(dir, "# goal-state\n\nupdated")
-check("checkpoint file", fs.existsSync(cp.path) && fs.readFileSync(cp.path, "utf8").includes("updated"))
-
-// 9. bootstrap idempotent
+// 7. bootstrap indexes markdown only — never imports or rewrites work_items
 const b1 = PM.bootstrap(db, dir, fts)
 const b2 = PM.bootstrap(db, dir, fts)
-check("bootstrap idempotent", b1.imported === b2.imported, `${b1.imported} vs ${b2.imported}`)
+check("bootstrap never imports work items", b1.imported === 0 && b2.imported === 0, `${b1.imported} vs ${b2.imported}`)
+check("bootstrap idempotent sources", JSON.stringify(b1.sources) === JSON.stringify(b2.sources))
 
-// 10. PARTIAL via FTS candidate
+// 8. PARTIAL via FTS candidate (related context)
 const c10 = PM.claimWorkItem(db, { canonicalKey: "network probe of device", summary: "ports scanned", ownerSession: "ses_A" })
 PM.recordResult(db, { ticket: c10.ok ? c10.item.id : c10.inProgress.id, status: "done", summary: "ports scanned: 53,80,443 open" })
 r = PM.preflight(db, { task: "probe device ports deeper", claim: true, ownerSession: "ses_E", projectDir: dir, fts })
 check("FTS candidate → PARTIAL", r.status === "PARTIAL", JSON.stringify(r))
 
-// 11. in_progress candidate dedup (different wording → IN_PROGRESS, no 2nd claim)
-const c11 = PM.claimWorkItem(db, { canonicalKey: "inspect widget alpha for flaws", ownerSession: "ses_A" })
-const t11 = c11.ok ? c11.item.id : c11.inProgress.id
-r = PM.preflight(db, { task: "determine whether flaws occur in widget alpha", claim: true, ownerSession: "ses_F", projectDir: dir, fts })
-check("in_progress candidate → IN_PROGRESS same ticket", r.status === "IN_PROGRESS" && r.ticket === t11, JSON.stringify(r))
+// 9. FTS-related ACTIVE work never becomes IN_PROGRESS automatically
+// A different wording FTS-matches the active ticket but must NOT inherit it:
+// the request claims its own NEW ticket and the active item stays untouched.
+// Isolated DB so the only FTS candidate is the active item itself.
+{
+  const dir9 = fs.mkdtempSync(path.join(os.tmpdir(), "pm-active-"))
+  const db9 = PM.openMemory(path.join(dir9, "memory.sqlite"))
+  const fts9 = PM.ftsAvailable(db9)
+  const c11 = PM.claimWorkItem(db9, { canonicalKey: "inspect widget alpha for flaws", ownerSession: "ses_A" })
+  const t11 = c11.ok ? c11.item.id : c11.inProgress.id
+  const r = PM.preflight(db9, { task: "determine whether flaws occur in widget alpha", claim: true, ownerSession: "ses_F", projectDir: dir9, fts: fts9 })
+  check("FTS active candidate NOT auto-IN_PROGRESS", r.status === "NEW", JSON.stringify(r))
+  check("FTS active candidate claims its own ticket", !!r.ticket && r.ticket !== t11, JSON.stringify(r))
+  const activeRow = db9.query("SELECT * FROM work_items WHERE id=?").get(t11) as any
+  check("FTS active item untouched", activeRow.status === "in_progress" && activeRow.owner_session === "ses_A", JSON.stringify(activeRow))
+  db9.close()
+}
 
-// 12. concurrent failure ids all unique (collision-safe)
+// 10. concurrent failure ids all unique (collision-safe)
 const ids12: string[] = []
 await Promise.all(Array.from({ length: 20 }, async (_, i) => {
   const f12 = PM.appendFailure(db, { projectDir: dir, symptom: `s${i}`, cause: `c${i}`, lesson: `l${i}`, fts })
@@ -89,7 +88,7 @@ await Promise.all(Array.from({ length: 20 }, async (_, i) => {
 }))
 check("concurrent failure ids unique", new Set(ids12).size === ids12.length, ids12.join(" "))
 
-// 13. FTS sync staleness race: same-ms insert after a sync is missed by max-updated_at-only tracking
+// 11. FTS sync staleness race: same-ms insert after a sync is missed by max-updated_at-only tracking
 const dir13 = fs.mkdtempSync(path.join(os.tmpdir(), "pm-fts-"))
 const db13 = PM.openMemory(path.join(dir13, "memory.sqlite"))
 const fts13 = PM.ftsAvailable(db13)
@@ -102,27 +101,7 @@ PM.maybeSyncFts(db13, fts13)
 const n13 = (db13.query("SELECT COUNT(*) AS n FROM memory_fts WHERE canonical_key='widget beta'").get() as { n: number }).n
 check("fts staleness race: same-ms insert synced", n13 === 1, `count=${n13}`)
 
-// 14-17. goal checkpoint managed section (G1 history preserve, G2 replace, G3 tiny, G5 no tmp files)
-const GS = "<!-- PROJECT-MEMORY:CURRENT-START -->"
-const GE = "<!-- PROJECT-MEMORY:CURRENT-END -->"
-const dirG = fs.mkdtempSync(path.join(os.tmpdir(), "pm-goal-"))
-const gdir = path.join(dirG, ".opencode")
-fs.mkdirSync(gdir, { recursive: true })
-const hist = Array.from({ length: 200 }, (_, i) => `historical line ${i}`).join("\n")
-fs.writeFileSync(path.join(gdir, "goal-state.md"), hist, "utf8")
-PM.checkpointGoal(dirG, "checkpoint v1")
-let g1 = fs.readFileSync(path.join(gdir, "goal-state.md"), "utf8")
-check("G1 history preserved + section appended", g1.startsWith(hist) && g1.includes(GS) && g1.includes(GE) && g1.includes("checkpoint v1"))
-PM.checkpointGoal(dirG, "checkpoint v2")
-g1 = fs.readFileSync(path.join(gdir, "goal-state.md"), "utf8")
-check("G2 section replaced in place", g1.startsWith(hist) && g1.includes("checkpoint v2") && !g1.includes("checkpoint v1"))
-PM.checkpointGoal(dirG, "x")
-g1 = fs.readFileSync(path.join(gdir, "goal-state.md"), "utf8")
-check("G3 tiny checkpoint keeps history", g1.startsWith(hist) && g1.includes(GS + "\nx\n" + GE))
-const tmpLeft = fs.readdirSync(gdir).filter((f) => f.startsWith(".goal-state.md.tmp-")).length
-check("G5 no tmp files left behind", tmpLeft === 0, `left=${tmpLeft}`)
-
-// 18: failure append authorization matrix
+// 12: failure append authorization matrix
 {
   const primaries = ["orchestrator", "orchestrator-goal"]
   check("auth orchestrator can append failures", PM.canAppendFailure("orchestrator", primaries) === true)
@@ -133,7 +112,7 @@ check("G5 no tmp files left behind", tmpLeft === 0, `left=${tmpLeft}`)
   check("auth unknown agent cannot append failures", PM.canAppendFailure("", primaries) === false)
 }
 
-// 19: failed record → re-claimable as NEW on the SAME ticket (retry semantics)
+// 13: failed record → re-claimable as NEW on the SAME ticket (retry semantics)
 const c19 = PM.claimWorkItem(db, { canonicalKey: "widget failed retry", ownerSession: "ses_A", summary: "widget failed retry" })
 const t19 = c19.ok ? c19.item.id : c19.inProgress.id
 const rec19 = PM.recordResult(db, { ticket: t19, status: "failed", summary: "retry failed" })
