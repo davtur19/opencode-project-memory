@@ -4,6 +4,23 @@ This plugin gives persistent project memory to OpenCode agents.
 
 The plugin stores project facts, work items, and failures in a local SQLite database. It prevents duplicate investigative work. It keeps the project state across sessions.
 
+## Why
+
+Investigative agents often repeat the same work. The plugin solves these problems:
+
+- Duplicate investigations: The preflight check detects work that is already covered.
+- Concurrent claims: The atomic claim prevents two agents from owning the same work item.
+- Stale or missing context: The goal state file and the memory database keep the context across sessions.
+- Shared-state races: The serialized writers prevent concurrent writes to the same files.
+
+## Requirements
+
+- OpenCode with plugin support.
+- Bun runtime.
+- SQLite with FTS5 support.
+
+The plugin does not implement a background runtime. It uses the background subagent support of OpenCode (or a compatible fork) when it is available.
+
 ## Tools
 
 The plugin provides these tools:
@@ -33,6 +50,20 @@ Run this command to build the plugin:
 bun build project-memory.ts --outfile project-memory.js --external @opencode-ai/plugin --target bun
 ```
 
+## Installation
+
+1. Build the plugin. See the section "Build".
+2. Copy the file `project-memory.js` to the plugins directory of your OpenCode installation.
+3. Add the plugin path to the OpenCode configuration file. Example:
+
+```jsonc
+{
+  "plugin": ["/path/to/plugins/project-memory.js"]
+}
+```
+
+4. Restart OpenCode.
+
 ## Test
 
 Run these commands to test the plugin:
@@ -44,12 +75,6 @@ bun test/claim-race.ts <db> <key> <who>
 ```
 
 The file `test/claim-race.ts` requires three arguments. Exactly one contender must win the race.
-
-## Installation
-
-1. Copy the file `project-memory.js` to the OpenCode plugins directory.
-2. Add the plugin path to the OpenCode configuration file.
-3. Restart OpenCode.
 
 ## License
 
