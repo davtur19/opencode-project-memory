@@ -32,7 +32,12 @@ const claim = (db: PM.DB, key: string, owner: string) => {
   const row = db.query("SELECT * FROM work_items WHERE id=?").get(t) as any
   check("G1 parent keeps ownership", row.owner_session === "ses_parent", JSON.stringify(row))
   check("G1 child recorded as worker", row.worker_session === "ses_child", JSON.stringify(row))
-  check("G1 gate still allows the parent", PM.gateDecision(db, { sessionID: "ses_parent", args: { subagent_type: "subagent" } }).action === "allow")
+  // duplicate-worker protection: a second task() on the SAME bound claim is blocked
+  const g1 = PM.gateDecision(db, { sessionID: "ses_parent", args: { subagent_type: "subagent" } })
+  check("G1 duplicate task blocked", g1.action === "block", JSON.stringify(g1))
+  // but steering via task_id still allowed
+  const g1s = PM.gateDecision(db, { sessionID: "ses_parent", args: { task_id: "ses_child" } })
+  check("G1 steering still allowed", g1s.action === "allow", JSON.stringify(g1s))
 }
 
 // G2 — the loop scenario: after one claim+bind, the parent can claim a SECOND
@@ -42,7 +47,7 @@ const claim = (db: PM.DB, key: string, owner: string) => {
   const t1 = claim(db, "task g2 alpha", "ses_parent")
   PM.bindClaimToChild(db, "ses_parent", "ses_child1")
   const g1 = PM.gateDecision(db, { sessionID: "ses_parent", args: { subagent_type: "subagent" } })
-  check("G2 gate allows first delegation", g1.action === "allow" && g1.ticket === t1, JSON.stringify(g1))
+  check("G2 duplicate task blocked on bound claim", g1.action === "block", JSON.stringify(g1))
   // ensure strictly newer updated_at so the gate's ORDER BY updated_at DESC is deterministic
   await new Promise((r) => setTimeout(r, 10))
   const t2 = claim(db, "task g2 beta", "ses_parent")
@@ -210,6 +215,30 @@ const claim = (db: PM.DB, key: string, owner: string) => {
   // its gate does NOT allow task() — no duplicate worker possible
   const g = PM.gateDecision(db, { sessionID: "ses_primary_b", args: { subagent_type: "subagent" } })
   check("G11 gate blocks second primary", g.action === "block", JSON.stringify(g))
+}
+
+// G12 — intra-session duplicate worker: a second task() on a claim that already
+// has a bound worker is BLOCKED by the gate (not just at preflight). This pins
+// the live-smoke FAIL (step 6).
+{
+  const { db, dir, fts } = freshDb("g12")
+  const t = claim(db, "task g12", "ses_owner")
+  // first delegation: claim has no worker yet → allowed
+  const g1 = PM.gateDecision(db, { sessionID: "ses_owner", args: { subagent_type: "subagent" } })
+  check("G12 first delegation allowed", g1.action === "allow" && g1.ticket === t, JSON.stringify(g1))
+  // child spawns → worker bound to the claim
+  PM.bindClaimToChild(db, "ses_owner", "ses_worker_a")
+  // second delegation (duplicate, same work, same owner) → BLOCKED
+  const g2 = PM.gateDecision(db, { sessionID: "ses_owner", args: { subagent_type: "subagent" } })
+  check("G12 duplicate delegation blocked", g2.action === "block", JSON.stringify(g2))
+  check("G12 block message steers", (g2.reason ?? "").includes("steer the existing worker"), g2.reason ?? "")
+  // steering that existing worker via task_id still allowed
+  const g3 = PM.gateDecision(db, { sessionID: "ses_owner", args: { task_id: "ses_worker_a" } })
+  check("G12 steering allowed", g3.action === "allow", JSON.stringify(g3))
+  // single claim kept, worker NOT re-bound to a duplicate
+  const row = db.query("SELECT * FROM work_items WHERE id=?").get(t) as any
+  check("G12 worker still worker_a", row.worker_session === "ses_worker_a", JSON.stringify(row))
+  check("G12 one in_progress claim", (db.query("SELECT COUNT(*) AS n FROM work_items WHERE canonical_key='task g12' AND status='in_progress'").get() as { n: number }).n === 1)
 }
 
 console.log(`\nRESULT: ${pass} pass, ${fail} fail`)

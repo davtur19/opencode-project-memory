@@ -388,7 +388,7 @@ function reclaimWorkItem(db, opts) {
   const historyNote = `[reclaim] ${now} from ${item.owner_session ?? "none"} to ${opts.ownerSession}`;
   const notes = [item.notes, historyNote].filter(Boolean).join(`
 `);
-  const res = db.run("UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=? WHERE id=? AND status='in_progress' AND owner_session=?", [opts.ownerSession, notes, now, now, opts.ticket, opts.previousOwner]);
+  const res = db.run("UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=?, worker_session=NULL WHERE id=? AND status='in_progress' AND owner_session=?", [opts.ownerSession, notes, now, now, opts.ticket, opts.previousOwner]);
   if (res.changes === 0) {
     const cur = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
     if (!cur)
@@ -753,8 +753,12 @@ function gateDecision(db, opts) {
   if (st === "vision" || st === "verifier")
     return { action: "allow", reason: `exempt: ${st}` };
   const claim = db.query("SELECT * FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1").get(opts.sessionID);
-  if (claim)
+  if (claim) {
+    if (claim.worker_session) {
+      return { action: "block", reason: "project-memory gate: a worker is already delegated for this work (session " + claim.worker_session + "). Do not retry task() \u2014 steer the existing worker via task_id, or reclaim only if orphaned. (Set PROJECT_MEMORY_GATE=warn to relax.)" };
+    }
     return { action: "allow", reason: "preflight ticket", ticket: claim.id };
+  }
   const lastRaw = db.query("SELECT value FROM meta WHERE key=?").get(`last_preflight:${opts.sessionID}`)?.value;
   let last;
   if (lastRaw) {

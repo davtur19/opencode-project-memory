@@ -308,7 +308,7 @@ export function reclaimWorkItem(db: Database, opts: { ticket: string; task: stri
   const historyNote = `[reclaim] ${now} from ${item.owner_session ?? "none"} to ${opts.ownerSession}`
   const notes = [item.notes, historyNote].filter(Boolean).join("\n")
   const res = db.run(
-    "UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=? WHERE id=? AND status='in_progress' AND owner_session=?",
+    "UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=?, worker_session=NULL WHERE id=? AND status='in_progress' AND owner_session=?",
     [opts.ownerSession, notes, now, now, opts.ticket, opts.previousOwner],
   )
   if (res.changes === 0) {
@@ -679,7 +679,12 @@ export function gateDecision(db: Database, opts: { sessionID: string; args: { ta
   const st = args.subagent_type
   if (st === "vision" || st === "verifier") return { action: "allow", reason: `exempt: ${st}` }
   const claim = db.query("SELECT * FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1").get(opts.sessionID) as WorkItem | undefined
-  if (claim) return { action: "allow", reason: "preflight ticket", ticket: claim.id }
+  if (claim) {
+    if (claim.worker_session) {
+      return { action: "block", reason: "project-memory gate: a worker is already delegated for this work (session " + claim.worker_session + "). Do not retry task() — steer the existing worker via task_id, or reclaim only if orphaned. (Set PROJECT_MEMORY_GATE=warn to relax.)" }
+    }
+    return { action: "allow", reason: "preflight ticket", ticket: claim.id }
+  }
   const lastRaw = (db.query("SELECT value FROM meta WHERE key=?").get(`last_preflight:${opts.sessionID}`) as { value: string } | undefined)?.value
   let last: { status?: string; next_action?: string } | undefined
   if (lastRaw) { try { last = JSON.parse(lastRaw) } catch { last = undefined } }
