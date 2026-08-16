@@ -34,6 +34,14 @@ function nowIso() {
 function normalizeKey(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
+var REF_BUDGET = 40;
+function compactRef(s, budget = REF_BUDGET) {
+  const norm = normalizeKey(s).replace(/\s+/g, " ").trim();
+  if (norm.length <= budget)
+    return norm;
+  const hash = crypto.createHash("sha256").update(norm).digest("hex").slice(0, 6);
+  return `${norm.slice(0, budget)}~${hash}`;
+}
 var SCHEMA = `
 CREATE TABLE IF NOT EXISTS work_items (
   id TEXT PRIMARY KEY,
@@ -382,7 +390,7 @@ function reclaimWorkItem(db, opts) {
   const key = normalizeKey(opts.task);
   const overlap = tokenOverlap(key, `${item.canonical_key} ${item.summary} ${item.unresolved}`);
   if (key !== item.canonical_key && overlap < MIN_SEMANTIC_OVERLAP) {
-    return { ok: false, reason: `reclaim denied: requested work does not correspond to ticket ${opts.ticket} (canonical_key=${item.canonical_key}, overlap=${overlap})` };
+    return { ok: false, reason: `reclaim denied: requested work does not correspond to ticket ${opts.ticket} (ref=${compactRef(item.canonical_key)}, overlap=${overlap})` };
   }
   const now = nowIso();
   const historyNote = `[reclaim] ${now} from ${item.owner_session ?? "none"} to ${opts.ownerSession}`;
@@ -399,6 +407,11 @@ function reclaimWorkItem(db, opts) {
   }
   return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket), previous_owner: opts.previousOwner, reclaimed_at: now };
 }
+function matchedOf(item, key) {
+  if (item.canonical_key === key)
+    return;
+  return { ticket: item.id, ref: compactRef(item.canonical_key) };
+}
 function recordLastPreflight(db, sessionID, res) {
   db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [`last_preflight:${sessionID}`, JSON.stringify({ status: res.status, next_action: res.next_action ?? null, ticket: res.ticket ?? null })]);
 }
@@ -414,7 +427,7 @@ function preflight(db, opts) {
         const key = normalizeKey(opts.task);
         const readFirst = readFirstFor(db, key, opts.fts);
         const sc = ensureScratch(projectScratchBase(opts.projectDir), r.item.id);
-        res = { status: "NEW", ticket: r.item.id, canonical_key: r.item.canonical_key, requested_key: key, matched_key: r.item.canonical_key, match_reason: "reclaimed", summary: r.item.summary, established: r.item.summary ? [r.item.summary] : [], do_not_repeat: [], unresolved: r.item.unresolved ? [r.item.unresolved] : [], evidence: evidenceFor(db, r.item.id).slice(0, 10), read_first: readFirst, scratch: sc, owner_session: opts.ownerSession, candidates: [], reclaimed: { previous_owner: r.previous_owner, reclaimed_at: r.reclaimed_at } };
+        res = { status: "NEW", ticket: r.item.id, match_reason: "reclaimed", established: [], do_not_repeat: [], unresolved: r.item.unresolved ? [r.item.unresolved] : [opts.task], evidence: evidenceFor(db, r.item.id).slice(0, 10), read_first: readFirst, scratch: sc, owner_session: opts.ownerSession, candidates: [], reclaimed: { previous_owner: r.previous_owner, reclaimed_at: r.reclaimed_at }, next_action: "DELEGATE" };
       } else {
         res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts });
         res = { ...res, reclaim_error: r.reason };
@@ -466,24 +479,24 @@ function preflightCore(db, opts) {
   const cap = (a, n) => a.slice(0, n);
   if (item) {
     if (item.status === "in_progress") {
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, owner_session: item.owner_session ?? undefined, summary: item.summary, established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], next_action: inProgressAction(item, opts.ownerSession), worker_session: item.worker_session ?? undefined };
+      return { status: "IN_PROGRESS", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], owner_session: item.owner_session ?? undefined, next_action: inProgressAction(item, opts.ownerSession), worker_session: item.worker_session ?? undefined };
     }
     if (item.status === "done" || item.status === "covered" || item.status === "blocked") {
       const unresolved = item.unresolved ? [item.unresolved] : [];
       if (item.status === "blocked")
         unresolved.unshift(`BLOCKED: ${item.summary}`);
-      return { status: "COVERED", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, summary: item.summary, established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${item.canonical_key} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], next_action: "USE_EXISTING" };
+      return { status: "COVERED", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${compactRef(item.canonical_key)} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], next_action: "USE_EXISTING" };
     }
     if (opts.claim) {
       const priorNote = item.status === "failed" ? "prior failed attempt: " + [item.summary, item.notes].filter(Boolean).join(" | ") : "";
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: priorNote, ownerSession: opts.ownerSession, source: "agent" });
       if (c.ok) {
         const sc = ensureScratch(scratchBase, c.item.id);
-        return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], next_action: "DELEGATE" };
+        return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], next_action: "DELEGATE" };
       }
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
+      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
     }
-    return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], next_action: "DELEGATE" };
+    return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], next_action: "DELEGATE" };
   }
   let reuseDenied = [];
   let reuseConsidered = [];
@@ -491,38 +504,38 @@ function preflightCore(db, opts) {
   if (inProgressCandidates.length > 0) {
     const scored = inProgressCandidates.map((c) => ({ c, overlap: tokenOverlap(key, `${c.canonical_key} ${c.summary} ${c.unresolved}`) }));
     const best = scored.reduce((a, b) => b.overlap > a.overlap || b.overlap === a.overlap && (b.c.fts_rank ?? 0) < (a.c.fts_rank ?? 0) ? b : a);
-    reuseConsidered = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap, selected: c.id === best.c.id }));
+    reuseConsidered = scored.map(({ c, overlap }) => ({ id: c.id, ref: compactRef(c.canonical_key), overlap, selected: c.id === best.c.id }));
     if (best.overlap >= MIN_SEMANTIC_OVERLAP) {
       const c = best.c;
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: best.overlap, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered, next_action: inProgressAction(c, opts.ownerSession), worker_session: c.worker_session ?? undefined };
+      return { status: "IN_PROGRESS", ticket: c.id, match_reason: "semantic-continuation", match_score: best.overlap, matched: matchedOf(c, key), established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered, owner_session: c.owner_session ?? undefined, next_action: inProgressAction(c, opts.ownerSession), worker_session: c.worker_session ?? undefined };
     }
-    reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap }));
+    reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, ref: compactRef(c.canonical_key), overlap }));
   }
   const doneCandidates = candidates.filter((c) => c.status === "done" || c.status === "covered" || c.status === "blocked");
   if (doneCandidates.length > 0) {
-    const established = doneCandidates.map((c) => `${c.canonical_key}: ${c.summary}`);
-    const dnr = doneCandidates.map((c) => `Covered by ${c.canonical_key} (${c.id})`);
+    const established = doneCandidates.map((c) => c.summary || compactRef(c.canonical_key));
+    const dnr = doneCandidates.map((c) => `Covered by ${compactRef(c.canonical_key)} (${c.id})`);
     const ev = cap(doneCandidates.flatMap((c) => evidenceFor(db, c.id)), 10);
-    const cand = doneCandidates.map((c) => ({ key: c.canonical_key, status: c.status, id: c.id }));
+    const cand = doneCandidates.map((c) => ({ ticket: c.id, ref: compactRef(c.canonical_key), status: c.status }));
     if (opts.claim) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: `delta of ${doneCandidates[0].canonical_key}`, ownerSession: opts.ownerSession, parentKey: doneCandidates[0].canonical_key, source: "agent" });
       if (c.ok) {
         const sc = ensureScratch(scratchBase, c.item.id);
-        return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE_DELTA" };
+        return { status: "PARTIAL", ticket: c.item.id, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE_DELTA" };
       }
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
+      return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
     }
-    return { status: "PARTIAL", canonical_key: key, requested_key: key, match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE_DELTA" };
+    return { status: "PARTIAL", match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE_DELTA" };
   }
   if (opts.claim) {
     const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" });
     if (c.ok) {
       const sc = ensureScratch(scratchBase, c.item.id);
-      return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE" };
+      return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE" };
     }
-    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
+    return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, owner_session: c.inProgress.owner_session ?? undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
   }
-  return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE" };
+  return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: "DELEGATE" };
 }
 function recordResult(db, opts) {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
