@@ -15,11 +15,15 @@ Investigative subagents often repeat the same work. The plugin solves these prob
 
 ## Requirements
 
-- OpenCode with plugin support.
+- OpenCode with plugin/custom-tool API support.
 - Bun runtime.
 - SQLite with FTS5 support.
 
-The plugin does not implement a background runtime. It uses the background subagent support of OpenCode (or a compatible fork) when it is available.
+Background subagents are not required for memory and preflight themselves. The recommended async orchestration workflow — task(background=true) for independent work and task_id to continue or steer an existing worker — requires an OpenCode version with native background subagent support. Enable it with:
+
+OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
+
+Compatibility is claimed only for the OpenCode versions this plugin was tested with.
 
 ## Tools
 
