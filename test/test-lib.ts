@@ -1,0 +1,93 @@
+import * as PM from "../lib/project-memory-lib"
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
+
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-test-"))
+const dbPath = path.join(dir, "memory.sqlite")
+const db = PM.openMemory(dbPath)
+const fts = PM.ftsAvailable(db)
+console.log("FTS available:", fts)
+
+let pass = 0, fail = 0
+function check(name: string, cond: boolean, extra = "") {
+  if (cond) { pass++; console.log("PASS", name) } else { fail++; console.log("FAIL", name, extra) }
+}
+
+// 1. NEW + claim
+let r = PM.preflight(db, { task: "analyze widget X", claim: true, ownerSession: "ses_A", projectDir: dir, fts })
+check("NEW claim", r.status === "NEW" && !!r.ticket, JSON.stringify(r))
+const ticket1 = r.ticket!
+check("scratch created", !!r.scratch && fs.existsSync(r.scratch!), r.scratch)
+
+// 2. same session re-preflight → IN_PROGRESS
+r = PM.preflight(db, { task: "analyze widget X", claim: true, ownerSession: "ses_A", projectDir: dir, fts })
+check("re-claim own → IN_PROGRESS", r.status === "IN_PROGRESS", JSON.stringify(r))
+
+// 3. other session → IN_PROGRESS with owner
+r = PM.preflight(db, { task: "analyze widget X", claim: true, ownerSession: "ses_B", projectDir: dir, fts })
+check("other session → IN_PROGRESS owner", r.status === "IN_PROGRESS" && r.owner_session === "ses_A", JSON.stringify(r))
+
+// 4. record done → COVERED
+let rec = PM.recordResult(db, { ticket: ticket1, status: "done", summary: "widget X analyzed: no vuln", evidence: ["report_widget_x.md"], facts: [{ key: "widget.x", value: "no vuln" }] })
+check("record ok", rec.ok, JSON.stringify(rec))
+r = PM.preflight(db, { task: "analyze widget X", claim: true, ownerSession: "ses_C", projectDir: dir, fts })
+check("done → COVERED", r.status === "COVERED", JSON.stringify(r))
+check("COVERED evidence", r.evidence.includes("report_widget_x.md"), JSON.stringify(r.evidence))
+
+// 5. alias match
+const c5 = PM.claimWorkItem(db, { canonicalKey: "widget Y", ownerSession: "ses_A" })
+check("claim widget Y", c5.ok)
+const y = db.query("SELECT * FROM work_items WHERE canonical_key='widget y'").get() as any
+db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?)", [y.id, "wy"])
+r = PM.preflight(db, { task: "wy", claim: false, ownerSession: "ses_A", projectDir: dir, fts })
+check("alias match → IN_PROGRESS", r.status === "IN_PROGRESS", JSON.stringify(r))
+
+// 6. gate
+let g = PM.gateDecision(db, { sessionID: "ses_C", args: { subagent_type: "subagent" } })
+check("gate block (no claim)", g.action === "block", JSON.stringify(g))
+g = PM.gateDecision(db, { sessionID: "ses_C", args: { subagent_type: "vision" } })
+check("gate allow vision", g.action === "allow")
+g = PM.gateDecision(db, { sessionID: "ses_C", args: { task_id: "ses_123" } })
+check("gate allow steering", g.action === "allow")
+g = PM.gateDecision(db, { sessionID: "ses_A", args: { subagent_type: "subagent" } })
+check("gate allow (has claim)", g.action === "allow", JSON.stringify(g))
+
+// 7. failure append
+const f = PM.appendFailure(db, { projectDir: dir, symptom: "s", cause: "c", lesson: "l", topic: "widget X", fts })
+check("failure id format", /^FAIL-\d{8}-[A-Z0-9]{8}$/.test(f.id), f.id)
+check("failure file exists", fs.existsSync(f.path))
+r = PM.preflight(db, { task: "widget X", claim: false, ownerSession: "ses_D", projectDir: dir, fts })
+check("failure topic → COVERED", r.status === "COVERED", JSON.stringify(r))
+
+// 8. goal checkpoint
+const cp = PM.checkpointGoal(dir, "# goal-state\n\nupdated")
+check("checkpoint file", fs.existsSync(cp.path) && fs.readFileSync(cp.path, "utf8").includes("updated"))
+
+// 9. bootstrap idempotent
+const b1 = PM.bootstrap(db, dir, fts)
+const b2 = PM.bootstrap(db, dir, fts)
+check("bootstrap idempotent", b1.imported === b2.imported, `${b1.imported} vs ${b2.imported}`)
+
+// 10. PARTIAL via FTS candidate
+const c10 = PM.claimWorkItem(db, { canonicalKey: "network probe of device", summary: "ports scanned", ownerSession: "ses_A" })
+PM.recordResult(db, { ticket: c10.ok ? c10.item.id : c10.inProgress.id, status: "done", summary: "ports scanned: 53,80,443 open" })
+r = PM.preflight(db, { task: "probe device ports deeper", claim: true, ownerSession: "ses_E", projectDir: dir, fts })
+check("FTS candidate → PARTIAL", r.status === "PARTIAL", JSON.stringify(r))
+
+// 11. in_progress candidate dedup (different wording → IN_PROGRESS, no 2nd claim)
+const c11 = PM.claimWorkItem(db, { canonicalKey: "inspect widget alpha for flaws", ownerSession: "ses_A" })
+const t11 = c11.ok ? c11.item.id : c11.inProgress.id
+r = PM.preflight(db, { task: "determine whether flaws occur in widget alpha", claim: true, ownerSession: "ses_F", projectDir: dir, fts })
+check("in_progress candidate → IN_PROGRESS same ticket", r.status === "IN_PROGRESS" && r.ticket === t11, JSON.stringify(r))
+
+// 12. concurrent failure ids all unique (collision-safe)
+const ids12: string[] = []
+await Promise.all(Array.from({ length: 20 }, async (_, i) => {
+  const f12 = PM.appendFailure(db, { projectDir: dir, symptom: `s${i}`, cause: `c${i}`, lesson: `l${i}`, fts })
+  ids12.push(f12.id)
+}))
+check("concurrent failure ids unique", new Set(ids12).size === ids12.length, ids12.join(" "))
+
+console.log(`\nRESULT: ${pass} pass, ${fail} fail`)
+process.exit(fail ? 1 : 0)

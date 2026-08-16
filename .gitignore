@@ -1,0 +1,7 @@
+node_modules/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+# repo-local GitHub token (fine-grained, ONLY for davtur19/opencode-project-memory)
+.github-token
