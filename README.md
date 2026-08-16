@@ -24,6 +24,7 @@ The plugin persists and retrieves state. The LLM generates, combines and chooses
 2. Do not repeat COVERED or IN_PROGRESS work. For PARTIAL work, do only the unresolved delta.
 3. Run independent work with `task(background=true)`. Steer an existing worker via its `task_id`.
 4. Save the result with `project_work_save(ticket=..., status=..., summary=..., evidence=..., facts=...)`.
+5. If `project_work_check` returns IN_PROGRESS, never retry `task()` for that work. Steer the existing worker via `task_id` when possible; reclaim only if orphaned; otherwise continue other work.
 
 ## Idea loop (V2)
 

@@ -208,7 +208,7 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
   PM.bindClaimToChild(db, "ses_primary", "ses_worker")
   const r1 = PM.preflight(db, { task: "disable VOX25 DHCP", claim: true, ownerSession: "ses_primary", projectDir: dir, fts })
   check("P10 IN_PROGRESS same ticket", r1.status === "IN_PROGRESS" && r1.ticket === t, JSON.stringify(r1))
-  const r2 = PM.preflight(db, { task: "disable VOX25 DHCP", claim: true, ownerSession: "ses_primary2", projectDir: dir, fts, reclaimTicket: t, reclaimOwner: "ses_worker" })
+  const r2 = PM.preflight(db, { task: "disable VOX25 DHCP", claim: true, ownerSession: "ses_primary2", projectDir: dir, fts, reclaimTicket: t, reclaimOwner: "ses_primary" })
   check("P10 reclaim → NEW same ticket", r2.status === "NEW" && r2.ticket === t, JSON.stringify(r2))
   check("P10 owner ses_primary2", r2.owner_session === "ses_primary2", JSON.stringify(r2))
   check("P10 gate allow", PM.gateDecision(db, { sessionID: "ses_primary2", args: { subagent_type: "subagent" } }).action === "allow")

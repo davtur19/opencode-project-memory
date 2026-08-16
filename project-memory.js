@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS work_items (
   source TEXT DEFAULT 'agent',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  reclaimed_at TEXT
+  reclaimed_at TEXT,
+  worker_session TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_key ON work_items(canonical_key);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_active ON work_items(canonical_key) WHERE status='in_progress';
@@ -100,17 +101,14 @@ function openMemory(dbPath) {
   return db;
 }
 function migrateSchema(db) {
-  const sql = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get()?.sql ?? "";
-  if (sql.includes("'failed'"))
-    return;
   db.exec("PRAGMA foreign_keys=OFF");
   try {
     db.transaction(() => {
       const sql2 = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get()?.sql ?? "";
       if (sql2.includes("'failed'"))
         return;
-      db.exec("CREATE TABLE work_items_new (id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered','failed')), summary TEXT DEFAULT '', unresolved TEXT DEFAULT '', notes TEXT DEFAULT '', owner_session TEXT, parent_key TEXT, source TEXT DEFAULT 'agent', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reclaimed_at TEXT)");
-      db.run("INSERT INTO work_items_new (rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, reclaimed_at) SELECT rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, NULL FROM work_items");
+      db.exec("CREATE TABLE work_items_new (id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered','failed')), summary TEXT DEFAULT '', unresolved TEXT DEFAULT '', notes TEXT DEFAULT '', owner_session TEXT, parent_key TEXT, source TEXT DEFAULT 'agent', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reclaimed_at TEXT, worker_session TEXT)");
+      db.run("INSERT INTO work_items_new (rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, reclaimed_at, worker_session) SELECT rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, NULL, NULL FROM work_items");
       db.exec("DROP TABLE work_items");
       db.exec("ALTER TABLE work_items_new RENAME TO work_items");
     })();
@@ -120,6 +118,10 @@ function migrateSchema(db) {
       throw e;
   } finally {
     db.exec("PRAGMA foreign_keys=ON");
+  }
+  const cols = db.query("PRAGMA table_info(work_items)").all().map((c) => c.name);
+  if (!cols.includes("worker_session")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN worker_session TEXT");
   }
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_key ON work_items(canonical_key)");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_active ON work_items(canonical_key) WHERE status='in_progress'");
@@ -415,6 +417,13 @@ function preflight(db, opts) {
   }
   return preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts });
 }
+function inProgressAction(item, currentSession) {
+  if (item.worker_session)
+    return "STEER";
+  if (item.owner_session && item.owner_session !== currentSession)
+    return "WAIT";
+  return "DELEGATE";
+}
 function preflightCore(db, opts) {
   const key = normalizeKey(opts.task);
   maybeSyncFts(db, opts.fts);
@@ -448,7 +457,7 @@ function preflightCore(db, opts) {
   const cap = (a, n) => a.slice(0, n);
   if (item) {
     if (item.status === "in_progress") {
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, owner_session: item.owner_session ?? undefined, summary: item.summary, established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] };
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, owner_session: item.owner_session ?? undefined, summary: item.summary, established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], next_action: inProgressAction(item, opts.ownerSession), worker_session: item.worker_session ?? undefined };
     }
     if (item.status === "done" || item.status === "covered" || item.status === "blocked") {
       const unresolved = item.unresolved ? [item.unresolved] : [];
@@ -463,7 +472,7 @@ function preflightCore(db, opts) {
         const sc = ensureScratch(scratchBase, c.item.id);
         return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] };
       }
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [] };
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
     }
     return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] };
   }
@@ -476,7 +485,7 @@ function preflightCore(db, opts) {
     reuseConsidered = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap, selected: c.id === best.c.id }));
     if (best.overlap >= MIN_SEMANTIC_OVERLAP) {
       const c = best.c;
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: best.overlap, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered };
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: best.overlap, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered, next_action: inProgressAction(c, opts.ownerSession), worker_session: c.worker_session ?? undefined };
     }
     reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap }));
   }
@@ -492,7 +501,7 @@ function preflightCore(db, opts) {
         const sc = ensureScratch(scratchBase, c.item.id);
         return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
       }
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
     }
     return { status: "PARTIAL", canonical_key: key, requested_key: key, match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
   }
@@ -502,7 +511,7 @@ function preflightCore(db, opts) {
       const sc = ensureScratch(scratchBase, c.item.id);
       return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
     }
-    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
+    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined };
   }
   return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
 }
@@ -737,10 +746,10 @@ function gateDecision(db, opts) {
   const claim = db.query("SELECT * FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1").get(opts.sessionID);
   if (claim)
     return { action: "allow", reason: "preflight ticket", ticket: claim.id };
-  return { action: "block", reason: "project-memory gate: no preflight ticket for this session. Run project_work_check(work=...) before delegating. (Set PROJECT_MEMORY_GATE=warn to relax.)" };
+  return { action: "block", reason: "project-memory gate: no preflight ticket for this session. Run project_work_check(work=...) to check status before delegating. If it returns IN_PROGRESS, do NOT retry task() for that work: steer the existing worker via task_id, reclaim only if orphaned, or continue other work. (Set PROJECT_MEMORY_GATE=warn to relax.)" };
 }
 function bindClaimToChild(db, parentID, childSessionID) {
-  db.run("UPDATE work_items SET owner_session=?, updated_at=? WHERE id=(SELECT id FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1)", [childSessionID, nowIso(), parentID]);
+  db.run("UPDATE work_items SET worker_session=?, updated_at=? WHERE id=(SELECT id FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1)", [childSessionID, nowIso(), parentID]);
 }
 function openHandle(dbPath) {
   return { db: openMemory(dbPath), path: dbPath };

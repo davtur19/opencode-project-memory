@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS work_items (
   source TEXT DEFAULT 'agent',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  reclaimed_at TEXT
+  reclaimed_at TEXT,
+  worker_session TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_key ON work_items(canonical_key);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_active ON work_items(canonical_key) WHERE status='in_progress';
@@ -79,7 +80,7 @@ export type DB = Database
 export type WorkItem = {
   id: string; canonical_key: string; status: string; summary: string; unresolved: string;
   notes: string; owner_session: string | null; parent_key: string | null; source: string;
-  created_at: string; updated_at: string; reclaimed_at: string | null
+  created_at: string; updated_at: string; reclaimed_at: string | null; worker_session: string | null
 }
 
 export function openMemory(dbPath: string): Database {
@@ -106,17 +107,15 @@ export function openMemory(dbPath: string): Database {
   return db
 }
 
-// ---------- schema migration (adds 'failed' status + reclaimed_at column) ----------
+// ---------- schema migration (adds 'failed' status + reclaimed_at column, then worker_session column) ----------
 export function migrateSchema(db: Database): void {
-  const sql = (db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get() as { sql: string } | undefined)?.sql ?? ""
-  if (sql.includes("'failed'")) return // already migrated / fresh DB
   db.exec("PRAGMA foreign_keys=OFF")
   try {
     db.transaction(() => {
       const sql2 = (db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get() as { sql: string } | undefined)?.sql ?? ""
       if (sql2.includes("'failed'")) return
-      db.exec("CREATE TABLE work_items_new (id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered','failed')), summary TEXT DEFAULT '', unresolved TEXT DEFAULT '', notes TEXT DEFAULT '', owner_session TEXT, parent_key TEXT, source TEXT DEFAULT 'agent', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reclaimed_at TEXT)")
-      db.run("INSERT INTO work_items_new (rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, reclaimed_at) SELECT rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, NULL FROM work_items")
+      db.exec("CREATE TABLE work_items_new (id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered','failed')), summary TEXT DEFAULT '', unresolved TEXT DEFAULT '', notes TEXT DEFAULT '', owner_session TEXT, parent_key TEXT, source TEXT DEFAULT 'agent', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reclaimed_at TEXT, worker_session TEXT)")
+      db.run("INSERT INTO work_items_new (rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, reclaimed_at, worker_session) SELECT rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, NULL, NULL FROM work_items")
       db.exec("DROP TABLE work_items")
       db.exec("ALTER TABLE work_items_new RENAME TO work_items")
     })()
@@ -126,6 +125,14 @@ export function migrateSchema(db: Database): void {
     // a concurrent migration won — swallow
   } finally {
     db.exec("PRAGMA foreign_keys=ON")
+  }
+  // worker_session column: added by this plugin version. Fresh DBs already have
+  // it via SCHEMA; DBs migrated by an older plugin version (has 'failed' but no
+  // worker_session) get the column added in place. Idempotent: re-running finds
+  // the column present and does nothing.
+  const cols = (db.query("PRAGMA table_info(work_items)").all() as { name: string }[]).map((c) => c.name)
+  if (!cols.includes("worker_session")) {
+    db.exec("ALTER TABLE work_items ADD COLUMN worker_session TEXT")
   }
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_key ON work_items(canonical_key)")
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_active ON work_items(canonical_key) WHERE status='in_progress'")
@@ -333,6 +340,8 @@ export type PreflightResult = {
   read_first: string[]
   scratch?: string
   owner_session?: string
+  next_action?: "STEER" | "WAIT" | "DELEGATE"
+  worker_session?: string
   reclaimed?: { previous_owner: string | null; reclaimed_at: string }
   reclaim_error?: string
   candidates: { key: string; status: string; id: string }[]
@@ -355,6 +364,15 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
     return { ...res, reclaim_error: r.reason }
   }
   return preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts })
+}
+
+// What an orchestrator should do about an IN_PROGRESS ticket: STEER when a worker
+// is already bound, WAIT when another session owns the claim (still running),
+// DELEGATE when the current session owns the claim but no worker was spawned yet.
+function inProgressAction(item: WorkItem, currentSession: string): "STEER" | "WAIT" | "DELEGATE" {
+  if (item.worker_session) return "STEER"
+  if (item.owner_session && item.owner_session !== currentSession) return "WAIT"
+  return "DELEGATE"
 }
 
 export function preflightCore(db: Database, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean }): PreflightResult {
@@ -388,7 +406,7 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
 
   if (item) {
     if (item.status === "in_progress") {
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, owner_session: item.owner_session ?? undefined, summary: item.summary, established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, owner_session: item.owner_session ?? undefined, summary: item.summary, established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [], next_action: inProgressAction(item, opts.ownerSession), worker_session: item.worker_session ?? undefined }
     }
     if (item.status === "done" || item.status === "covered" || item.status === "blocked") {
       const unresolved = item.unresolved ? [item.unresolved] : []
@@ -400,7 +418,7 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
       const priorNote = item.status === "failed" ? "prior failed attempt: " + [item.summary, item.notes].filter(Boolean).join(" | ") : ""
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: priorNote, ownerSession: opts.ownerSession, source: "agent" })
       if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] } }
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [] }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined }
     }
     return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] }
   }
@@ -420,7 +438,7 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
     reuseConsidered = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap, selected: c.id === best.c.id }))
     if (best.overlap >= MIN_SEMANTIC_OVERLAP) {
       const c = best.c
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: best.overlap, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: best.overlap, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered, next_action: inProgressAction(c, opts.ownerSession), worker_session: c.worker_session ?? undefined }
     }
     reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap }))
   }
@@ -434,7 +452,7 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
     if (opts.claim) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: `delta of ${doneCandidates[0].canonical_key}`, ownerSession: opts.ownerSession, parentKey: doneCandidates[0].canonical_key, source: "agent" })
       if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined } }
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined }
     }
     return { status: "PARTIAL", canonical_key: key, requested_key: key, match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined }
   }
@@ -443,7 +461,7 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
   if (opts.claim) {
     const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" })
     if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined } }
-    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined }
+    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined, next_action: inProgressAction(c.inProgress, opts.ownerSession), worker_session: c.inProgress.worker_session ?? undefined }
   }
   return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined }
 }
@@ -652,12 +670,17 @@ export function gateDecision(db: Database, opts: { sessionID: string; args: { ta
   if (st === "vision" || st === "verifier") return { action: "allow", reason: `exempt: ${st}` }
   const claim = db.query("SELECT * FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1").get(opts.sessionID) as WorkItem | undefined
   if (claim) return { action: "allow", reason: "preflight ticket", ticket: claim.id }
-  return { action: "block", reason: "project-memory gate: no preflight ticket for this session. Run project_work_check(work=...) before delegating. (Set PROJECT_MEMORY_GATE=warn to relax.)" }
+  return { action: "block", reason: "project-memory gate: no preflight ticket for this session. Run project_work_check(work=...) to check status before delegating. If it returns IN_PROGRESS, do NOT retry task() for that work: steer the existing worker via task_id, reclaim only if orphaned, or continue other work. (Set PROJECT_MEMORY_GATE=warn to relax.)" }
 }
 
 // ---------- claim → child session binding (for steering via task_id) ----------
+// Records the child as the WORKER of the parent's most recent in_progress claim.
+// The parent KEEPS the claim (owner_session unchanged) so the orchestrator can
+// delegate again later; the child session id is recorded in worker_session for
+// steering/audit. Before this change ownership was TRANSFERRED to the child,
+// which broke every subsequent task() for the parent (gate had no claim left).
 export function bindClaimToChild(db: Database, parentID: string, childSessionID: string) {
-  db.run("UPDATE work_items SET owner_session=?, updated_at=? WHERE id=(SELECT id FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1)", [childSessionID, nowIso(), parentID])
+  db.run("UPDATE work_items SET worker_session=?, updated_at=? WHERE id=(SELECT id FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1)", [childSessionID, nowIso(), parentID])
 }
 
 // ---------- fail-closed memory access (recovery + MEMORY_ERROR) ----------
