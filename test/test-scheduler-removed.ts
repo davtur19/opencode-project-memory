@@ -53,7 +53,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pm-nosched-"))
   const t1 = c1.ok ? c1.item.id : c1.inProgress.id
   // completed item supplies PARTIAL context
   const c2 = PM.claimWorkItem(db, { canonicalKey: "network probe of device", summary: "ports scanned", ownerSession: "ses_A" })
-  PM.recordResult(db, { ticket: c2.ok ? c2.item.id : c2.inProgress.id, status: "done", summary: "ports scanned: 53,80,443 open" })
+  PM.recordResult(db, { ticket: c2.ok ? c2.item.id : c2.inProgress.id, status: "done", summary: "ports scanned: 53,80,443 open", ownerSession: "ses_A" })
   db.close()
   const hooks: any = await (plugin as any).server({ directory: dir })
   // active FTS candidate must NOT become IN_PROGRESS
@@ -105,13 +105,30 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pm-nosched-"))
   hdb.close()
   const hooks: any = await (plugin as any).server({ directory: dir })
   const out = JSON.parse(await hooks.tool.project_failure_save.execute({ symptom: "boom", cause: "x", lesson: "avoid x" }, { sessionID: "s1", agent: "subagent", directory: dir }))
-  check("9 subagent failure_save ok", out.ok === true && /^FAIL-\d{8}-/.test(out.id ?? ""), JSON.stringify(out))
+  check("9 subagent failure_save denied", out.ok === false, JSON.stringify(out))
   const wr = JSON.parse(await hooks.tool.project_work_check.execute({ work: "fresh never-seen topic zzqq" }, { sessionID: "s2", agent: "orchestrator", directory: dir }))
   check("10 work_check NEW semantics", wr.status === "NEW" && !!wr.ticket, JSON.stringify(wr))
   const saved = JSON.parse(await hooks.tool.project_work_save.execute({ ticket: wr.ticket, status: "done", summary: "resolved" }, { sessionID: "s2", agent: "orchestrator", directory: dir }))
   check("10 work_save ok", saved.ok === true, JSON.stringify(saved))
   const cov = JSON.parse(await hooks.tool.project_work_check.execute({ work: "fresh never-seen topic zzqq" }, { sessionID: "s3", agent: "orchestrator", directory: dir }))
   check("10 work_check COVERED semantics", cov.status === "COVERED" && cov.ticket === wr.ticket, JSON.stringify(cov))
+}
+
+// ---- 10b: work_save ownership at the plugin level: a foreign primary session cannot
+// finish an in_progress ticket; the owning session can ----
+{
+  const dir = path.join(tmp, "owner")
+  fs.mkdirSync(path.join(dir, ".opencode"), { recursive: true })
+  const hdb = PM.openMemory(path.join(dir, ".opencode", "memory.sqlite"))
+  PM.ftsAvailable(hdb)
+  hdb.close()
+  const hooks: any = await (plugin as any).server({ directory: dir })
+  const wr = JSON.parse(await hooks.tool.project_work_check.execute({ work: "ownership enforcement topic" }, { sessionID: "sA", agent: "orchestrator", directory: dir }))
+  check("10b work_check claims for sA", wr.status === "NEW" && !!wr.ticket, JSON.stringify(wr))
+  const foreign = JSON.parse(await hooks.tool.project_work_save.execute({ ticket: wr.ticket, status: "done", summary: "stolen" }, { sessionID: "sB", agent: "orchestrator", directory: dir }))
+  check("10b foreign session work_save denied", foreign.ok === false && /owned by/.test(foreign.reason ?? ""), JSON.stringify(foreign))
+  const own = JSON.parse(await hooks.tool.project_work_save.execute({ ticket: wr.ticket, status: "done", summary: "owned" }, { sessionID: "sA", agent: "orchestrator", directory: dir }))
+  check("10b owning session work_save ok", own.ok === true, JSON.stringify(own))
 }
 
 console.log(`\nRESULT: ${pass} pass, ${fail} fail`)

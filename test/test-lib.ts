@@ -29,7 +29,7 @@ r = PM.preflight(db, { task: "analyze widget X", claim: true, ownerSession: "ses
 check("other session → IN_PROGRESS owner", r.status === "IN_PROGRESS" && r.owner_session === "ses_A", JSON.stringify(r))
 
 // 4. record done → COVERED
-let rec = PM.recordResult(db, { ticket: ticket1, status: "done", summary: "widget X analyzed: no vuln", evidence: ["report_widget_x.md"] })
+let rec = PM.recordResult(db, { ticket: ticket1, status: "done", summary: "widget X analyzed: no vuln", evidence: ["report_widget_x.md"], ownerSession: "ses_A" })
 check("record ok", rec.ok, JSON.stringify(rec))
 r = PM.preflight(db, { task: "analyze widget X", claim: true, ownerSession: "ses_C", projectDir: dir, fts })
 check("done → COVERED", r.status === "COVERED", JSON.stringify(r))
@@ -58,7 +58,7 @@ check("bootstrap idempotent sources", JSON.stringify(b1.sources) === JSON.string
 
 // 8. PARTIAL via FTS candidate (related context)
 const c10 = PM.claimWorkItem(db, { canonicalKey: "network probe of device", summary: "ports scanned", ownerSession: "ses_A" })
-PM.recordResult(db, { ticket: c10.ok ? c10.item.id : c10.inProgress.id, status: "done", summary: "ports scanned: 53,80,443 open" })
+PM.recordResult(db, { ticket: c10.ok ? c10.item.id : c10.inProgress.id, status: "done", summary: "ports scanned: 53,80,443 open", ownerSession: "ses_A" })
 r = PM.preflight(db, { task: "probe device ports deeper", claim: true, ownerSession: "ses_E", projectDir: dir, fts })
 check("FTS candidate → PARTIAL", r.status === "PARTIAL", JSON.stringify(r))
 
@@ -106,20 +106,30 @@ check("fts staleness race: same-ms insert synced", n13 === 1, `count=${n13}`)
   const primaries = ["orchestrator", "orchestrator-goal"]
   check("auth orchestrator can append failures", PM.canAppendFailure("orchestrator", primaries) === true)
   check("auth orchestrator-goal can append failures", PM.canAppendFailure("orchestrator-goal", primaries) === true)
-  check("auth subagent can append failures", PM.canAppendFailure("subagent", primaries) === true)
+  check("auth subagent cannot append failures", PM.canAppendFailure("subagent", primaries) === false)
   check("auth verifier cannot append failures", PM.canAppendFailure("verifier", primaries) === false)
   check("auth vision cannot append failures", PM.canAppendFailure("vision", primaries) === false)
   check("auth unknown agent cannot append failures", PM.canAppendFailure("", primaries) === false)
 }
 
-// 13: failed record → re-claimable as NEW on the SAME ticket (retry semantics)
+// 13: failed record → re-claimable on the SAME ticket with PARTIAL semantics
+// (prior failure context + do_not_repeat + evidence returned, not fresh NEW work)
 const c19 = PM.claimWorkItem(db, { canonicalKey: "widget failed retry", ownerSession: "ses_A", summary: "widget failed retry" })
 const t19 = c19.ok ? c19.item.id : c19.inProgress.id
-const rec19 = PM.recordResult(db, { ticket: t19, status: "failed", summary: "retry failed" })
+const rec19 = PM.recordResult(db, { ticket: t19, status: "failed", summary: "retry failed", evidence: ["fail_log.txt"], ownerSession: "ses_A" })
 check("19 record failed ok", rec19.ok, JSON.stringify(rec19))
 r = PM.preflight(db, { task: "widget failed retry", claim: true, ownerSession: "ses_G", projectDir: dir, fts })
-check("19 failed → NEW same ticket", r.status === "NEW" && r.ticket === t19, JSON.stringify(r))
+check("19 failed → PARTIAL same ticket", r.status === "PARTIAL" && r.ticket === t19, JSON.stringify(r))
+check("19 PARTIAL keeps prior failure context", r.established.some((e) => e.includes("prior failed attempt") && e.includes("retry failed")), JSON.stringify(r.established))
+check("19 PARTIAL carries do_not_repeat", r.do_not_repeat.some((d) => /Prior attempt failed/i.test(d)), JSON.stringify(r.do_not_repeat))
+check("19 PARTIAL keeps prior evidence", r.evidence.includes("fail_log.txt"), JSON.stringify(r.evidence))
+check("19 PARTIAL unresolved is the retried work", r.unresolved.some((u) => u.includes("widget failed retry")), JSON.stringify(r.unresolved))
 check("19 count 1", (db.query("SELECT COUNT(*) AS n FROM work_items WHERE canonical_key='widget failed retry'").get() as any).n === 1)
+// stored unresolved delta on the failed row is preferred over the request text
+const rec19b = PM.recordResult(db, { ticket: t19, status: "failed", summary: "still failing", unresolved: "fix the sink function only", ownerSession: "ses_G" })
+check("19b record failed with delta ok", rec19b.ok, JSON.stringify(rec19b))
+r = PM.preflight(db, { task: "widget failed retry", claim: true, ownerSession: "ses_H", projectDir: dir, fts })
+check("19b PARTIAL carries stored delta", r.status === "PARTIAL" && r.ticket === t19 && r.unresolved.some((u) => u.includes("fix the sink function only")), JSON.stringify(r.unresolved))
 
 console.log(`\nRESULT: ${pass} pass, ${fail} fail`)
 process.exit(fail ? 1 : 0)

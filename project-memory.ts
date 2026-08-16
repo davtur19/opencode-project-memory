@@ -27,7 +27,7 @@ export default {
     return {
       tool: {
         project_work_check: tool({
-          description: "Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress. Semantics: NEW = new work; PARTIAL = use established context and do unresolved work; COVERED = reuse the stored result; IN_PROGRESS = do not duplicate, reclaim only if known orphaned; MEMORY_ERROR = memory is uncertain.",
+          description: "Check durable project work that future sessions could meaningfully reuse. Do not use for trivial, transient, or one-shot actions. Returns NEW, PARTIAL, COVERED, IN_PROGRESS, or MEMORY_ERROR.",
           args: {
             work: tool.schema.string().describe("Work to check in project memory"),
             claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
@@ -49,7 +49,7 @@ export default {
           },
         }),
         project_work_save: tool({
-          description: "Save durable results and evidence learned from work.",
+          description: "Save durable reusable results and evidence from project work. Do not save trivial, transient, or one-shot information.",
           args: {
             ticket: tool.schema.string().describe("Work item id from project_work_check"),
             status: tool.schema.enum(["done", "blocked", "failed"]),
@@ -61,7 +61,7 @@ export default {
             if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
             if (!isPrimary(tctx.agent ?? "")) return JSON.stringify({ ok: false, error: "only primary agents can record results" })
             try {
-              const res = PM.recordResult(handle.db, args)
+              const res = PM.recordResult(handle.db, { ...args, ownerSession: tctx.sessionID })
               if (res.ok) PM.syncAllFts(handle.db, fts)
               return JSON.stringify(res)
             } catch (e: any) {
@@ -70,7 +70,7 @@ export default {
           },
         }),
         project_failure_save: tool({
-          description: "Save a reusable failure or blocker when it can prevent repeated wasted work.",
+          description: "Save a stable or reproducible failure only when it has an actionable lesson likely to prevent meaningful repeated work. Ordinary failed attempts belong in the work result.",
           args: {
             symptom: tool.schema.string().describe("What failed"),
             cause: tool.schema.string().describe("Known cause, or unknown"),
@@ -111,7 +111,7 @@ export default {
               idea: tool.schema.string(),
               kind: tool.schema.enum(PM2.RELATION_KINDS as unknown as [string, ...string[]]),
               target: tool.schema.string(),
-            })).optional().describe("Relations to add (targets must already exist)"),
+            })).optional().describe("Relations to add; targets must exist already or be explicitly declared in this call"),
             satisfies: tool.schema.array(tool.schema.string()).optional().describe("Condition keys this validated idea satisfies"),
             remove_relations: tool.schema.array(tool.schema.object({
               idea: tool.schema.string(),

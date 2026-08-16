@@ -24,7 +24,7 @@ console.log("FTS available:", fts)
   const c = PM.claimWorkItem(db, { canonicalKey: "v1 sanity", ownerSession: "ses_A" })
   const t = c.ok ? c.item.id : c.inProgress.id
   const pre = PM.preflight(db, { task: "v1 sanity", claim: false, ownerSession: "ses_A", projectDir: dir, fts })
-  const rec = PM.recordResult(db, { ticket: t, status: "done", summary: "ok" })
+  const rec = PM.recordResult(db, { ticket: t, status: "done", summary: "ok", ownerSession: "ses_A" })
   check("V1 claim+preflight+record works on V2 db", c.ok && pre.status === "IN_PROGRESS" && rec.ok, JSON.stringify({ pre, rec }))
 }
 

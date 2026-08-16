@@ -56,7 +56,7 @@ const SUMMARY_BLOCKED = "VOX30 smtpc email RCE static sink analysis — delegati
 {
   const { db, dir, fts } = freshDb("c2")
   const t = claim(db, "task covered item", "ses_A")
-  PM.recordResult(db, { ticket: t, status: "done", summary: "task covered item resolved" })
+  PM.recordResult(db, { ticket: t, status: "done", summary: "task covered item resolved", ownerSession: "ses_A" })
   const r = PM.preflight(db, { task: "task covered item", claim: true, ownerSession: "ses_B", projectDir: dir, fts })
   check("C2 COVERED same ticket", r.status === "COVERED" && r.ticket === t, JSON.stringify(r))
   const p = JSON.stringify(r, null, 2)
@@ -82,7 +82,7 @@ const SUMMARY_BLOCKED = "VOX30 smtpc email RCE static sink analysis — delegati
 {
   const { db, dir, fts } = freshDb("c4")
   const tP = claim(db, LONG_KEY, "ses_A")
-  PM.recordResult(db, { ticket: tP, status: "blocked", summary: SUMMARY_BLOCKED })
+  PM.recordResult(db, { ticket: tP, status: "blocked", summary: SUMMARY_BLOCKED, ownerSession: "ses_A" })
   const r = PM.preflight(db, { task: REQ, claim: true, ownerSession: "ses_B", projectDir: dir, fts })
   check("C4 PARTIAL via FTS candidate (unchanged)", r.status === "PARTIAL" && !!r.ticket && r.ticket !== tP, JSON.stringify(r))
   check("C4 candidates present", Array.isArray(r.candidates) && r.candidates.length === 1, JSON.stringify(r.candidates))
@@ -143,7 +143,7 @@ const SUMMARY_BLOCKED = "VOX30 smtpc email RCE static sink analysis — delegati
   check("C11 NEW", r1.status === "NEW" && !!r1.ticket, JSON.stringify(r1))
   const r2 = PM.preflight(db, { task: "fresh status task", claim: true, ownerSession: "ses_A", projectDir: dir, fts })
   check("C11 IN_PROGRESS same session", r2.status === "IN_PROGRESS" && r2.ticket === r1.ticket, JSON.stringify(r2))
-  PM.recordResult(db, { ticket: r1.ticket!, status: "done", summary: "done" })
+  PM.recordResult(db, { ticket: r1.ticket!, status: "done", summary: "done", ownerSession: "ses_A" })
   const r3 = PM.preflight(db, { task: "fresh status task", claim: true, ownerSession: "ses_B", projectDir: dir, fts })
   check("C11 COVERED after record", r3.status === "COVERED" && r3.ticket === r1.ticket, JSON.stringify(r3))
 }

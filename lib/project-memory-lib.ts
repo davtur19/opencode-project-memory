@@ -6,7 +6,7 @@ import * as crypto from "node:crypto"
 
 // ---------- authorization ----------
 export function canAppendFailure(agent: string, primaryAgents: string[]): boolean {
-  return primaryAgents.includes(agent) || agent === "subagent"
+  return primaryAgents.includes(agent)
 }
 
 // ---------- ULID (Crockford base32: 48-bit timestamp + 80-bit randomness) ----------
@@ -403,12 +403,26 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
       if (item.status === "blocked") unresolved.unshift(`BLOCKED: ${item.summary}`)
       return { status: "COVERED", ticket: item.id, match_reason: matchSrc ?? "exact", matched: matchedOf(item, key), established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${compactRef(item.canonical_key)} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
     }
-    // status 'new' / 'failed' → claimable
+    // status 'new' / 'failed' → claimable. A failed retry keeps PARTIAL semantics:
+    // the prior failure context (summary/notes), a do_not_repeat, the prior evidence
+    // and the still-open unresolved work are all returned on the SAME ticket — it is
+    // never presented as fresh work with empty context.
     if (opts.claim) {
       const priorNote = item.status === "failed" ? "prior failed attempt: " + [item.summary, item.notes].filter(Boolean).join(" | ") : ""
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: priorNote, ownerSession: opts.ownerSession, source: "agent" })
-      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] } }
+      if (c.ok) {
+        const sc = ensureScratch(scratchBase, c.item.id)
+        if (item.status === "failed") {
+          const prior = [item.summary, item.notes].filter(Boolean).join(" | ")
+          return { status: "PARTIAL", ticket: c.item.id, match_reason: "prior-failure", established: (prior ? [`prior failed attempt: ${prior}`] : []), do_not_repeat: [`Prior attempt failed (${compactRef(item.canonical_key)})${item.summary ? ": " + item.summary : ""}`.slice(0, 120)], unresolved: item.unresolved ? [item.unresolved] : [opts.task], evidence: cap(evidenceFor(db, c.item.id), 10), read_first: readFirst, scratch: sc, candidates: [] }
+        }
+        return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] }
+      }
       return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined }
+    }
+    if (item.status === "failed") {
+      const prior = [item.summary, item.notes].filter(Boolean).join(" | ")
+      return { status: "PARTIAL", match_reason: "prior-failure", established: (prior ? [`prior failed attempt: ${prior}`] : []), do_not_repeat: [`Prior attempt failed (${compactRef(item.canonical_key)})${item.summary ? ": " + item.summary : ""}`.slice(0, 120)], unresolved: item.unresolved ? [item.unresolved] : [opts.task], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
     }
     return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] }
   }
@@ -445,9 +459,18 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
 // ---------- record ----------
 // facts is deliberately not part of this API: it was written but never
 // retrieved. The legacy facts table remains in the schema for compatibility.
-export function recordResult(db: Database, opts: { ticket: string; status: string; summary?: string; unresolved?: string; evidence?: string[] }): { ok: true; item: WorkItem } | { ok: false; reason: string } {
+// Ownership: an in_progress ticket may only be updated/finished by the session
+// that holds it. Only the current owner may record on it (reclaim first via
+// project_work_check reclaim_ticket/reclaim_owner to take it over). Reclaim CAS
+// is untouched: after a successful reclaim the new owner matches the row and may
+// record. Terminal/claimable rows (done/blocked/covered/failed/new) carry no
+// ownership gate — only in_progress enforces it.
+export function recordResult(db: Database, opts: { ticket: string; status: string; summary?: string; unresolved?: string; evidence?: string[]; ownerSession?: string }): { ok: true; item: WorkItem } | { ok: false; reason: string } {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
   if (!item) return { ok: false, reason: `ticket not found: ${opts.ticket}` }
+  if (item.status === "in_progress" && item.owner_session && item.owner_session !== opts.ownerSession) {
+    return { ok: false, reason: `ticket ${opts.ticket} is in_progress and owned by ${item.owner_session}; session ${opts.ownerSession ?? "unknown"} cannot record it (reclaim via project_work_check with reclaim_ticket=${opts.ticket} and reclaim_owner=${item.owner_session})` }
+  }
   const now = nowIso()
   const status = ["done", "blocked", "failed"].includes(opts.status) ? opts.status : "done"
   db.run("UPDATE work_items SET status=?, summary=COALESCE(?, summary), unresolved=COALESCE(?, unresolved), updated_at=? WHERE id=?", [status, opts.summary ?? null, opts.unresolved ?? null, now, opts.ticket])

@@ -41,7 +41,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pm-failclosed-"))
   const h = PM.openHandle(p)
   const fts = PM.ftsAvailable(h.db)
   const c = PM.claimWorkItem(h.db, { canonicalKey: "alpha task", ownerSession: "ses_5" })
-  PM.recordResult(h.db, { ticket: c.ok ? c.item.id : c.inProgress.id, status: "done", summary: "alpha done" })
+  PM.recordResult(h.db, { ticket: c.ok ? c.item.id : c.inProgress.id, status: "done", summary: "alpha done", ownerSession: "ses_5" })
   const oldDb = h.db
   h.db.close()
   const r = PM.preflightSafe(h, { task: "alpha task", claim: false, ownerSession: "ses_5", projectDir: path.dirname(path.dirname(p)), fts })

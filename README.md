@@ -22,8 +22,8 @@ There are no hooks, no event listeners, and no gating of other tool calls.
 ## Work loop (V1)
 
 1. Before investigative work, call `project_work_check(work=...)`. A claim (default `claim: true`) atomically reserves NEW/PARTIAL work; pass `claim: false` to only query.
-2. The result carries `status`, `ticket`, `established`, `do_not_repeat`, `unresolved`, `evidence`, `read_first`, `scratch`, and `candidates`. Do not repeat COVERED or IN_PROGRESS work. For PARTIAL work, do only the unresolved delta.
-3. Save the result with `project_work_save(ticket=..., status=..., summary=..., evidence=...)`.
+2. The result carries `status`, `ticket`, `established`, `do_not_repeat`, `unresolved`, `evidence`, `read_first`, `scratch`, and `candidates`. Do not repeat COVERED or IN_PROGRESS work. For PARTIAL work, do only the unresolved delta. Retrying previously `failed` work returns PARTIAL on the SAME ticket with the prior failure context, a `do_not_repeat` for the failed attempt, the prior evidence and the still-open unresolved work — never fresh NEW work with empty context.
+3. Save the result with `project_work_save(ticket=..., status=..., summary=..., evidence=...)`. An `in_progress` ticket can only be recorded by the session that owns it; recording a foreign owner's `in_progress` ticket is denied (reclaim it first). Terminal/claimable rows are not ownership-gated.
 4. If `project_work_check` returns IN_PROGRESS, never retry `task()` for that work. Steer the existing worker via its `task_id` when possible; reclaim only if orphaned — with `reclaim_ticket` plus the `owner_session` observed in the IN_PROGRESS result (compare-and-swap on the current owner); otherwise continue other work.
 
 ## Idea loop (V2)
@@ -31,10 +31,10 @@ There are no hooks, no event listeners, and no gating of other tool calls.
 1. Before generating exploratory hypotheses, call `project_idea_search(query=...)`.
 2. Preserve materially distinct useful ideas with `project_idea_save(...)`.
 3. BLOCKED is not the same as DISPROVEN. Confirmed state changes require evidence:
-   - `validated` and `disproven` require non-empty `evidence`.
+   - `validated` and `disproven` require non-empty `evidence`, and a transition INTO either strong status must carry evidence supplied in that save — stale evidence from a previous conflicting state is never silently reused (re-saving the same strong status keeps its existing evidence).
    - A condition marked `satisfied: true` requires `satisfied_by`.
    - `satisfies` is accepted only from a `validated` idea that carries evidence; the condition's `satisfied_by` records the satisfying idea's id.
-   - Relation sources and targets must already exist — missing targets are never auto-created.
+   - Relation sources and targets must already exist or be explicitly declared in the same save call — missing targets are never auto-created into placeholders.
    - A save with any validation error is atomic: `ok: false` and nothing is written.
 4. Relation kinds: `requires`, `enables`, `supports`, `contradicts`, `combines_with`, `derived_from`.
 5. Idea lifecycle: `proposed`, `testing`, `validated`, `disproven`, `dormant`.
@@ -105,6 +105,7 @@ bun test/test-v2-e2e.ts
 bun test/test-v2-plugin.ts
 bun test/test-packet-compact.ts
 bun test/test-scheduler-removed.ts
+bun test/test-hardening.ts
 ```
 
 The file `test/claim-race.ts` requires three arguments. Exactly one contender must win the race.

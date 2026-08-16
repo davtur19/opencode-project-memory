@@ -80,9 +80,9 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
   const tDone = claim(db, "task done item", "ses_A")
   const tBlocked = claim(db, "task blocked item", "ses_B")
   const tFailed = claim(db, "task failed item", "ses_C")
-  PM.recordResult(db, { ticket: tDone, status: "done", summary: "done" })
-  PM.recordResult(db, { ticket: tBlocked, status: "blocked", summary: "blocked" })
-  PM.recordResult(db, { ticket: tFailed, status: "failed", summary: "failed" })
+  PM.recordResult(db, { ticket: tDone, status: "done", summary: "done", ownerSession: "ses_A" })
+  PM.recordResult(db, { ticket: tBlocked, status: "blocked", summary: "blocked", ownerSession: "ses_B" })
+  PM.recordResult(db, { ticket: tFailed, status: "failed", summary: "failed", ownerSession: "ses_C" })
   for (const [t, label] of [[tDone, "done"], [tBlocked, "blocked"]] as [string, string][]) {
     const r = PM.preflight(db, { task: "task " + label + " item", claim: true, ownerSession: "ses_reclaim", projectDir: dir, fts, reclaimTicket: t, reclaimOwner: t === tDone ? "ses_A" : "ses_B" })
     check("R5 " + label + " reclaim_error", !!(r as any).reclaim_error, JSON.stringify(r))
@@ -90,12 +90,12 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
     check("R5 " + label + " status unchanged", row.status === label, JSON.stringify(row))
   }
   // 'failed' is deliberately claimable (R7 retry semantics): the reclaim itself is
-  // denied (reclaim_error) but the preflight fallthrough re-claims it as NEW on the
-  // same ticket, so the row goes in_progress with the "prior failed attempt" note.
+  // denied (reclaim_error) but the preflight fallthrough re-claims it as PARTIAL on
+  // the same ticket, so the row goes in_progress with the "prior failed attempt" note.
   {
     const r = PM.preflight(db, { task: "task failed item", claim: true, ownerSession: "ses_reclaim", projectDir: dir, fts, reclaimTicket: tFailed, reclaimOwner: "ses_C" })
     check("R5 failed reclaim_error", !!(r as any).reclaim_error, JSON.stringify(r))
-    check("R5 failed retried as NEW same ticket", r.status === "NEW" && r.ticket === tFailed, JSON.stringify(r))
+    check("R5 failed retried as PARTIAL same ticket", r.status === "PARTIAL" && r.ticket === tFailed, JSON.stringify(r))
     const row = db.query("SELECT * FROM work_items WHERE id=?").get(tFailed) as any
     check("R5 failed retried row", row.status === "in_progress" && row.owner_session === "ses_reclaim" && (row.notes ?? "").includes("prior failed attempt"), JSON.stringify(row))
   }
@@ -157,12 +157,12 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
 {
   const { db, dir, fts } = freshDb("r7")
   const tA = claim(db, "investigate widget gamma", "ses_A")
-  const rec = PM.recordResult(db, { ticket: tA, status: "failed", summary: "no access" })
+  const rec = PM.recordResult(db, { ticket: tA, status: "failed", summary: "no access", ownerSession: "ses_A" })
   check("R7 record failed ok", rec.ok, JSON.stringify(rec))
   const row1 = db.query("SELECT * FROM work_items WHERE id=?").get(tA) as any
   check("R7 row status failed", row1.status === "failed", JSON.stringify(row1))
   const r = PM.preflight(db, { task: "investigate widget gamma", claim: true, ownerSession: "ses_new", projectDir: dir, fts })
-  check("R7 failed → NEW same ticket", r.status === "NEW" && r.ticket === tA, JSON.stringify(r))
+  check("R7 failed → PARTIAL same ticket", r.status === "PARTIAL" && r.ticket === tA, JSON.stringify(r))
   const row2 = db.query("SELECT * FROM work_items WHERE id=?").get(tA) as any
   check("R7 in_progress new owner", row2.status === "in_progress" && row2.owner_session === "ses_new", JSON.stringify(row2))
   check("R7 notes prior failed attempt", (row2.notes ?? "").includes("prior failed attempt"), row2.notes)
@@ -202,7 +202,7 @@ const count = (db: PM.DB, key: string) => (db.query("SELECT COUNT(*) AS n FROM w
   const mig1b = dbM2.query("SELECT * FROM work_items WHERE id='mig1'").get() as any
   check("MIG reopen preserved (idempotent)", mig1b?.canonical_key === "legacy task" && mig1b?.status === "in_progress", JSON.stringify(mig1b))
   const c2 = PM.claimWorkItem(dbM2, { canonicalKey: "fresh after migrate", ownerSession: "ses_fresh", summary: "fresh after migrate" })
-  const rec2 = PM.recordResult(dbM2, { ticket: c2.ok ? c2.item.id : c2.inProgress.id, status: "failed", summary: "boom" })
+  const rec2 = PM.recordResult(dbM2, { ticket: c2.ok ? c2.item.id : c2.inProgress.id, status: "failed", summary: "boom", ownerSession: "ses_fresh" })
   check("MIG failed allowed after migrate", rec2.ok, JSON.stringify(rec2))
   dbM2.close()
 }

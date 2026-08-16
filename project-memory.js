@@ -9,7 +9,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 function canAppendFailure(agent, primaryAgents) {
-  return primaryAgents.includes(agent) || agent === "subagent";
+  return primaryAgents.includes(agent);
 }
 var CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 function ulid(now = Date.now()) {
@@ -327,9 +327,17 @@ function preflightCore(db, opts) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: priorNote, ownerSession: opts.ownerSession, source: "agent" });
       if (c.ok) {
         const sc = ensureScratch(scratchBase, c.item.id);
+        if (item.status === "failed") {
+          const prior = [item.summary, item.notes].filter(Boolean).join(" | ");
+          return { status: "PARTIAL", ticket: c.item.id, match_reason: "prior-failure", established: prior ? [`prior failed attempt: ${prior}`] : [], do_not_repeat: [`Prior attempt failed (${compactRef(item.canonical_key)})${item.summary ? ": " + item.summary : ""}`.slice(0, 120)], unresolved: item.unresolved ? [item.unresolved] : [opts.task], evidence: cap(evidenceFor(db, c.item.id), 10), read_first: readFirst, scratch: sc, candidates: [] };
+        }
         return { status: "NEW", ticket: c.item.id, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] };
       }
       return { status: "IN_PROGRESS", ticket: c.inProgress.id, match_reason: "claim-conflict", established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], owner_session: c.inProgress.owner_session ?? undefined };
+    }
+    if (item.status === "failed") {
+      const prior = [item.summary, item.notes].filter(Boolean).join(" | ");
+      return { status: "PARTIAL", match_reason: "prior-failure", established: prior ? [`prior failed attempt: ${prior}`] : [], do_not_repeat: [`Prior attempt failed (${compactRef(item.canonical_key)})${item.summary ? ": " + item.summary : ""}`.slice(0, 120)], unresolved: item.unresolved ? [item.unresolved] : [opts.task], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] };
     }
     return { status: "NEW", match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] };
   }
@@ -363,6 +371,9 @@ function recordResult(db, opts) {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
   if (!item)
     return { ok: false, reason: `ticket not found: ${opts.ticket}` };
+  if (item.status === "in_progress" && item.owner_session && item.owner_session !== opts.ownerSession) {
+    return { ok: false, reason: `ticket ${opts.ticket} is in_progress and owned by ${item.owner_session}; session ${opts.ownerSession ?? "unknown"} cannot record it (reclaim via project_work_check with reclaim_ticket=${opts.ticket} and reclaim_owner=${item.owner_session})` };
+  }
   const now = nowIso();
   const status = ["done", "blocked", "failed"].includes(opts.status) ? opts.status : "done";
   db.run("UPDATE work_items SET status=?, summary=COALESCE(?, summary), unresolved=COALESCE(?, unresolved), updated_at=? WHERE id=?", [status, opts.summary ?? null, opts.unresolved ?? null, now, opts.ticket]);
@@ -574,7 +585,7 @@ function resolveIdea(db, ref) {
     return { id: byKey.id, canonical_key: byKey.canonical_key };
   return null;
 }
-function resolveTarget(db, target) {
+function resolveTarget(db, target, sameCall) {
   if (typeof target !== "string" || !target)
     return null;
   if (target.startsWith("condition:")) {
@@ -582,18 +593,22 @@ function resolveTarget(db, target) {
     if (!k2)
       return null;
     const row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k2);
-    if (!row)
-      return null;
-    return { target_type: "condition", target_id: row.id, target_key: row.canonical_key };
+    if (row)
+      return { target_type: "condition", target_id: row.id, target_key: row.canonical_key };
+    if (sameCall && sameCall.condIds.has(k2))
+      return { target_type: "condition", target_id: sameCall.condIds.get(k2), target_key: k2 };
+    return null;
   }
   if (target.startsWith("idea:")) {
     const k2 = normalizeKey(target.slice("idea:".length));
     if (!k2)
       return null;
     const row = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(k2);
-    if (!row)
-      return null;
-    return { target_type: "idea", target_id: row.id, target_key: row.canonical_key };
+    if (row)
+      return { target_type: "idea", target_id: row.id, target_key: row.canonical_key };
+    if (sameCall && k2 === sameCall.ideaKey)
+      return { target_type: "idea", target_id: sameCall.ideaId, target_key: sameCall.ideaKey };
+    return null;
   }
   const byIdeaId = db.query("SELECT * FROM ideas WHERE id=?").get(target);
   if (byIdeaId)
@@ -610,6 +625,12 @@ function resolveTarget(db, target) {
   const byCondKey = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k);
   if (byCondKey)
     return { target_type: "condition", target_id: byCondKey.id, target_key: byCondKey.canonical_key };
+  if (sameCall) {
+    if (target === sameCall.ideaId || k === sameCall.ideaKey)
+      return { target_type: "idea", target_id: sameCall.ideaId, target_key: sameCall.ideaKey };
+    if (sameCall.condIds.has(k))
+      return { target_type: "condition", target_id: sameCall.condIds.get(k), target_key: k };
+  }
   return null;
 }
 function derivedStateFor(db, ideaId) {
@@ -670,12 +691,18 @@ function ideaRecord(db, opts = {}) {
       errors.push(`invalid idea status '${ideaOpts.status}' (expected one of: ${IDEA_STATUSES.join(", ")})`);
   }
   const evidence = typeof ideaOpts.evidence === "string" ? ideaOpts.evidence : existingRow?.evidence ?? "";
+  const evidenceSupplied = typeof ideaOpts.evidence === "string" && ideaOpts.evidence.trim() !== "";
   if (status === "validated" || status === "disproven") {
-    if (typeof evidence !== "string" || evidence.trim() === "") {
+    if (evidence.trim() === "") {
       errors.push(`status '${status}' requires non-empty evidence`);
+    }
+    const statusChanging = !existingRow || existingRow.status !== status;
+    if (statusChanging && !evidenceSupplied) {
+      errors.push(`transition to '${status}' requires evidence supplied for this transition`);
     }
   }
   const condSpecs = [];
+  const condIds = new Map;
   for (const c of opts.conditions ?? []) {
     const ckey = normalizeKey(typeof c.key === "string" ? c.key : "");
     if (!ckey) {
@@ -685,8 +712,11 @@ function ideaRecord(db, opts = {}) {
     if (c.satisfied === true && !(typeof c.satisfied_by === "string" && c.satisfied_by.trim() !== "")) {
       errors.push(`condition '${ckey}' satisfied=true requires satisfied_by (explicit provenance)`);
     }
+    const existingCond = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(ckey);
+    condIds.set(ckey, existingCond?.id ?? ulid());
     condSpecs.push({ key: ckey, description: c.description, satisfied: c.satisfied, satisfied_by: c.satisfied_by });
   }
+  const sameCall = { ideaId, ideaKey: key, condIds };
   const satisfiesSpecs = [];
   for (const s of opts.satisfies ?? []) {
     const skey = normalizeKey(typeof s === "string" ? s : "");
@@ -726,7 +756,7 @@ function ideaRecord(db, opts = {}) {
       errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`);
       continue;
     }
-    const tr = resolveTarget(db, r.target);
+    const tr = resolveTarget(db, r.target, sameCall);
     if (!tr) {
       errors.push(`relation target not found: ${r.target}`);
       continue;
@@ -744,7 +774,7 @@ function ideaRecord(db, opts = {}) {
       errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`);
       continue;
     }
-    const tr = resolveTarget(db, r.target);
+    const tr = resolveTarget(db, r.target, sameCall);
     if (!tr) {
       errors.push(`relation target not found: ${r.target}`);
       continue;
@@ -755,13 +785,13 @@ function ideaRecord(db, opts = {}) {
     return { ok: false, error: errors.join("; "), errors };
   }
   try {
-    return db.transaction(() => applyIdeaRecord(db, { ideaId, ideaOpts, key, existingRow, statusProvided, status, evidence, condSpecs, satisfiesSpecs, relSpecs, remSpecs }))();
+    return db.transaction(() => applyIdeaRecord(db, { ideaId, ideaOpts, key, existingRow, statusProvided, status, evidence, condSpecs, condIds, satisfiesSpecs, relSpecs, remSpecs }))();
   } catch (e) {
     return { ok: false, error: `idea_save failed: ${e?.message ?? e}` };
   }
 }
 function applyIdeaRecord(db, cfg) {
-  const { ideaId, ideaOpts, key, existingRow, statusProvided, status, evidence, condSpecs, satisfiesSpecs, relSpecs, remSpecs } = cfg;
+  const { ideaId, ideaOpts, key, existingRow, statusProvided, status, evidence, condSpecs, condIds, satisfiesSpecs, relSpecs, remSpecs } = cfg;
   const now = nowIso();
   if (existingRow) {
     const sets = [];
@@ -797,7 +827,7 @@ function applyIdeaRecord(db, cfg) {
   const condTouched = new Map;
   for (const c of condSpecs) {
     const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(c.key);
-    const cid = existing?.id ?? ulid();
+    const cid = existing?.id ?? condIds.get(c.key) ?? ulid();
     const desc = typeof c.description === "string" ? c.description : existing?.description ?? c.key;
     let satisfied;
     let satisfiedBy;
@@ -870,7 +900,6 @@ function applyIdeaRecord(db, cfg) {
     removed_relations: removedRelations
   };
 }
-var SORT_ORDER = { ready: 0, blocked: 1, testing: 2, validated: 3, disproven: 4, dormant: 5 };
 function projectFrontier(db, opts = {}) {
   const limit = typeof opts?.limit === "number" && Number.isFinite(opts.limit) ? Math.max(1, Math.min(20, Math.floor(opts.limit))) : 8;
   const key = normalizeKey(typeof opts?.goal === "string" ? opts.goal : "");
@@ -897,7 +926,9 @@ function projectFrontier(db, opts = {}) {
       for (const c of candidates) {
         const rels = db.query("SELECT * FROM idea_relations WHERE idea_id=? OR (target_type='idea' AND target_id=?)").all(c.id, c.id);
         for (const rel of rels) {
-          const nid = rel.target_type === "idea" ? rel.target_id : rel.idea_id;
+          if (rel.target_type !== "idea")
+            continue;
+          const nid = rel.idea_id === c.id ? rel.target_id : rel.idea_id;
           if (!selected.has(nid)) {
             const nrow = db.query("SELECT * FROM ideas WHERE id=?").get(nid);
             if (nrow)
@@ -914,7 +945,6 @@ function projectFrontier(db, opts = {}) {
     const d = derivedStateFor(db, id);
     return { id: row.id, key: row.canonical_key, title: row.title, summary: row.summary, status: row.status, derived: d.derived, blockers: d.blockers, updated_at: row.updated_at };
   });
-  ideas.sort((a, b) => (SORT_ORDER[a.derived] ?? 9) - (SORT_ORDER[b.derived] ?? 9));
   const boundedIdeas = ideas.slice(0, limit);
   const condRows = [];
   if (selectedIds.length > 0) {
@@ -975,7 +1005,7 @@ var project_memory_default = {
     return {
       tool: {
         project_work_check: tool({
-          description: "Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress. Semantics: NEW = new work; PARTIAL = use established context and do unresolved work; COVERED = reuse the stored result; IN_PROGRESS = do not duplicate, reclaim only if known orphaned; MEMORY_ERROR = memory is uncertain.",
+          description: "Check durable project work that future sessions could meaningfully reuse. Do not use for trivial, transient, or one-shot actions. Returns NEW, PARTIAL, COVERED, IN_PROGRESS, or MEMORY_ERROR.",
           args: {
             work: tool.schema.string().describe("Work to check in project memory"),
             claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
@@ -1002,7 +1032,7 @@ var project_memory_default = {
           }
         }),
         project_work_save: tool({
-          description: "Save durable results and evidence learned from work.",
+          description: "Save durable reusable results and evidence from project work. Do not save trivial, transient, or one-shot information.",
           args: {
             ticket: tool.schema.string().describe("Work item id from project_work_check"),
             status: tool.schema.enum(["done", "blocked", "failed"]),
@@ -1016,7 +1046,7 @@ var project_memory_default = {
             if (!isPrimary(tctx.agent ?? ""))
               return JSON.stringify({ ok: false, error: "only primary agents can record results" });
             try {
-              const res = recordResult(handle.db, args);
+              const res = recordResult(handle.db, { ...args, ownerSession: tctx.sessionID });
               if (res.ok)
                 syncAllFts(handle.db, fts);
               return JSON.stringify(res);
@@ -1026,7 +1056,7 @@ var project_memory_default = {
           }
         }),
         project_failure_save: tool({
-          description: "Save a reusable failure or blocker when it can prevent repeated wasted work.",
+          description: "Save a stable or reproducible failure only when it has an actionable lesson likely to prevent meaningful repeated work. Ordinary failed attempts belong in the work result.",
           args: {
             symptom: tool.schema.string().describe("What failed"),
             cause: tool.schema.string().describe("Known cause, or unknown"),
@@ -1069,7 +1099,7 @@ var project_memory_default = {
               idea: tool.schema.string(),
               kind: tool.schema.enum(RELATION_KINDS),
               target: tool.schema.string()
-            })).optional().describe("Relations to add (targets must already exist)"),
+            })).optional().describe("Relations to add; targets must exist already or be explicitly declared in this call"),
             satisfies: tool.schema.array(tool.schema.string()).optional().describe("Condition keys this validated idea satisfies"),
             remove_relations: tool.schema.array(tool.schema.object({
               idea: tool.schema.string(),
