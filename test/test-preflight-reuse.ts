@@ -38,21 +38,24 @@ const claim = (db: PM.DB, key: string, owner: string) => {
   check("T2 match_score = overlap (3)", r.match_score === 3, JSON.stringify(r))
 }
 
-// T3 — no correlation at all → no reuse, diagnostics show no candidates
+// T3 — no correlation at all → no reuse (any stopword-only FTS candidates are
+// rejected with overlap below the threshold; a NEW ticket is claimed)
 {
   const { db, dir, fts } = freshDb("t3")
   const tA = claim(db, "investigate why session X hangs when starting the goal task", "ses_A")
   const r = PM.preflight(db, { task: "compile a rust program for the embedded target", claim: true, ownerSession: "ses_A", projectDir: dir, fts })
   check("T3 unrelated same-session NOT reused", r.status === "NEW" && r.ticket !== tA, JSON.stringify(r))
-  check("T3 no candidates → empty reuse diagnostics", (r.reuse_denied ?? []).length === 0 && (r.reuse_considered ?? []).length === 0, JSON.stringify({ rd: r.reuse_denied, rc: r.reuse_considered }))
+  check("T3 rejected candidates all below threshold", (r.reuse_denied ?? []).every((d) => d.overlap < 3), JSON.stringify(r.reuse_denied))
+  check("T3 best-ranked candidate still below threshold", (r.reuse_considered ?? []).every((c) => !c.selected || c.overlap < 3), JSON.stringify(r.reuse_considered))
 }
 
 // T4 — MULTIPLE in_progress candidates: the BEST overlap wins regardless of
-// array order. A ("fix local project" + notes "widget alpha flaw") matches 6 of
-// the request's FTS query terms so it ranks FIRST in the FTS result, yet its
-// significant overlap (canonical_key+summary+unresolved only) is 3; B
-// ("fix widget alpha flaw") has overlap 4. Selecting inProgressCandidates[0]
-// here would pick A — this test fails if that bug is ever reintroduced.
+// array order. A ("fix local project" + notes "widget alpha flaw") matches ALL
+// of the request's FTS query terms (fix, the, local, project, widget, alpha,
+// flaw) so it ranks FIRST in the FTS result, yet its significant overlap
+// (canonical_key+summary+unresolved only) is 3; B has overlap 4. Selecting
+// inProgressCandidates[0] here would pick A — this test fails if that bug is
+// ever reintroduced.
 {
   const { db, dir, fts } = freshDb("t4")
   const cA = PM.claimWorkItem(db, { canonicalKey: "fix local project", ownerSession: "ses_A", summary: "fix local project", notes: "widget alpha flaw" })

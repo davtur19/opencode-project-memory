@@ -181,10 +181,7 @@ function evidenceFor(db: Database, itemId: string): string[] {
   return (db.query("SELECT path FROM evidence WHERE work_item_id=?").all(itemId) as { path: string }[]).map((r) => r.path)
 }
 function ftsQuery(key: string): string {
-  // Significant tokens only: stopwords ("the", "when", "for", ...) must not be
-  // part of the query, otherwise ANY ticket sharing a stopword pollutes the
-  // candidate list with semantically unrelated rows (overlap 0).
-  const toks = [...sigTokens(key)]
+  const toks = key.split(" ").filter(Boolean)
   if (toks.length === 0) return '""'
   return toks.map((t) => `"${t}"`).join(" OR ")
 }

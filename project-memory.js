@@ -171,7 +171,7 @@ function evidenceFor(db, itemId) {
   return db.query("SELECT path FROM evidence WHERE work_item_id=?").all(itemId).map((r) => r.path);
 }
 function ftsQuery(key) {
-  const toks = [...sigTokens(key)];
+  const toks = key.split(" ").filter(Boolean);
   if (toks.length === 0)
     return '""';
   return toks.map((t) => `"${t}"`).join(" OR ");
