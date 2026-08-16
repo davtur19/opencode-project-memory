@@ -4,6 +4,11 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import * as crypto from "node:crypto"
 
+// ---------- authorization ----------
+export function canAppendFailure(agent: string, primaryAgents: string[]): boolean {
+  return primaryAgents.includes(agent) || agent === "subagent"
+}
+
 // ---------- ULID (Crockford base32: 48-bit timestamp + 80-bit randomness) ----------
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 export function ulid(now: number = Date.now()): string {

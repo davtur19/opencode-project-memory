@@ -27,10 +27,10 @@ export default {
     return {
       tool: {
         project_preflight: tool({
-          description: "Project memory preflight. Before delegating investigative work, run this to check whether the work is already covered (COVERED), partially covered (PARTIAL), new (NEW), or already in progress by another worker (IN_PROGRESS). Returns a structured context packet (established facts, do-not-repeat, unresolved delta, evidence, read-first references, ticket, scratch dir). Pass the packet to the worker. claim=true (default) atomically acquires ownership for NEW/PARTIAL. Returns MEMORY_ERROR (with readable error + technical cause) when the memory is unavailable or inconclusive — in that case delegation must be blocked.",
+          description: "Check project memory before investigative delegation. Returns COVERED, PARTIAL, NEW, IN_PROGRESS, or MEMORY_ERROR plus relevant prior context. Pass returned context to the worker. claim=true reserves NEW/PARTIAL work.",
           args: {
-            task: tool.schema.string().describe("Short description of the work to be delegated"),
-            claim: tool.schema.boolean().optional().describe("Acquire ownership claim (default true)"),
+            task: tool.schema.string().describe("Work to check in project memory"),
+            claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ status: "MEMORY_ERROR", canonical_key: PM.normalizeKey(args.task), error: { message: "project memory unavailable", cause: "init failed" } }, null, 2)
@@ -45,7 +45,7 @@ export default {
           },
         }),
         project_record: tool({
-          description: "Record the structured result of a delegated work item (ticket). Serialized single-writer registration of status, summary, evidence paths and facts. Primary agents only.",
+          description: "Record the final result, evidence and reusable facts for a preflight ticket. Primary agents only.",
           args: {
             ticket: tool.schema.string().describe("Work item id from project_preflight"),
             status: tool.schema.enum(["done", "blocked", "failed"]),
@@ -67,7 +67,7 @@ export default {
           },
         }),
         project_goal_checkpoint: tool({
-          description: "Write the current checkpoint section of the project goal-state.md (single logical writer: the orchestrator). Primary agents only. Content is the current checkpoint section; historical content outside the managed markers is preserved byte-for-byte.",
+          description: "Update the managed current-goal checkpoint while preserving goal-state history. Primary agents only.",
           args: { content: tool.schema.string() },
           execute: async (args: any, tctx: any) => {
             if (!isPrimary(tctx.agent ?? "")) return JSON.stringify({ ok: false, error: "only primary agents can checkpoint goal-state" })
@@ -76,16 +76,16 @@ export default {
           },
         }),
         project_failure_append: tool({
-          description: "Append a structured failure to the project FAILURES.md via the serialized writer, with a collision-safe FAIL-YYYYMMDD-<id> identifier, and register it in project memory. Primary agents only.",
+          description: "Record a reusable failure/blocker in project memory and FAILURES.md. Use only when it can prevent repeated wasted work.",
           args: {
-            symptom: tool.schema.string(),
-            cause: tool.schema.string(),
-            lesson: tool.schema.string(),
-            topic: tool.schema.string().optional().describe("Optional topic alias for retrieval"),
+            symptom: tool.schema.string().describe("What failed"),
+            cause: tool.schema.string().describe("Known cause, or unknown"),
+            lesson: tool.schema.string().describe("What future agents should do or avoid"),
+            topic: tool.schema.string().optional().describe("Optional retrieval topic"),
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
-            if (!isPrimary(tctx.agent ?? "")) return JSON.stringify({ ok: false, error: "only primary agents can append failures" })
+            if (!PM.canAppendFailure(tctx.agent ?? "", PRIMARY_AGENTS)) return JSON.stringify({ ok: false, error: "agent is not allowed to append project failures" })
             try {
               const res = PM.appendFailure(handle.db, { projectDir: directory, ...args, fts })
               PM.syncAllFts(handle.db, fts)

@@ -122,5 +122,16 @@ check("G3 tiny checkpoint keeps history", g1.startsWith(hist) && g1.includes(GS 
 const tmpLeft = fs.readdirSync(gdir).filter((f) => f.startsWith(".goal-state.md.tmp-")).length
 check("G5 no tmp files left behind", tmpLeft === 0, `left=${tmpLeft}`)
 
+// 18: failure append authorization matrix
+{
+  const primaries = ["orchestrator", "orchestrator-goal"]
+  check("auth orchestrator can append failures", PM.canAppendFailure("orchestrator", primaries) === true)
+  check("auth orchestrator-goal can append failures", PM.canAppendFailure("orchestrator-goal", primaries) === true)
+  check("auth subagent can append failures", PM.canAppendFailure("subagent", primaries) === true)
+  check("auth verifier cannot append failures", PM.canAppendFailure("verifier", primaries) === false)
+  check("auth vision cannot append failures", PM.canAppendFailure("vision", primaries) === false)
+  check("auth unknown agent cannot append failures", PM.canAppendFailure("", primaries) === false)
+}
+
 console.log(`\nRESULT: ${pass} pass, ${fail} fail`)
 process.exit(fail ? 1 : 0)
