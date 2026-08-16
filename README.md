@@ -6,7 +6,7 @@ The plugin stores project facts, work items, and failures in a local SQLite data
 
 ## Why
 
-Investigative agents often repeat the same work. The plugin solves these problems:
+Investigative subagents often repeat the same work. The plugin solves these problems:
 
 - Duplicate investigations: The preflight check detects work that is already covered.
 - Concurrent claims: The atomic claim prevents two agents from owning the same work item.
