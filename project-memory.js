@@ -38,7 +38,7 @@ var SCHEMA = `
 CREATE TABLE IF NOT EXISTS work_items (
   id TEXT PRIMARY KEY,
   canonical_key TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered')),
+  status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered','failed')),
   summary TEXT DEFAULT '',
   unresolved TEXT DEFAULT '',
   notes TEXT DEFAULT '',
@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS work_items (
   parent_key TEXT,
   source TEXT DEFAULT 'agent',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  reclaimed_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_key ON work_items(canonical_key);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_active ON work_items(canonical_key) WHERE status='in_progress';
@@ -95,7 +96,35 @@ function openMemory(dbPath) {
   }
   db.exec("PRAGMA foreign_keys=ON;");
   db.exec(SCHEMA);
+  migrateSchema(db);
   return db;
+}
+function migrateSchema(db) {
+  const sql = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get()?.sql ?? "";
+  if (sql.includes("'failed'"))
+    return;
+  db.exec("PRAGMA foreign_keys=OFF");
+  try {
+    db.transaction(() => {
+      const sql2 = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get()?.sql ?? "";
+      if (sql2.includes("'failed'"))
+        return;
+      db.exec("CREATE TABLE work_items_new (id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered','failed')), summary TEXT DEFAULT '', unresolved TEXT DEFAULT '', notes TEXT DEFAULT '', owner_session TEXT, parent_key TEXT, source TEXT DEFAULT 'agent', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reclaimed_at TEXT)");
+      db.run("INSERT INTO work_items_new (rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, reclaimed_at) SELECT rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, NULL FROM work_items");
+      db.exec("DROP TABLE work_items");
+      db.exec("ALTER TABLE work_items_new RENAME TO work_items");
+    })();
+  } catch (e) {
+    const sql3 = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get()?.sql ?? "";
+    if (!sql3.includes("'failed'"))
+      throw e;
+  } finally {
+    db.exec("PRAGMA foreign_keys=ON");
+  }
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_key ON work_items(canonical_key)");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_active ON work_items(canonical_key) WHERE status='in_progress'");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_work_items_owner ON work_items(owner_session)");
+  db.run("DELETE FROM meta WHERE key='last_fts_sync'");
 }
 function ftsAvailable(db) {
   try {
@@ -128,14 +157,14 @@ function claimWorkItem(db, opts) {
        VALUES (?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(canonical_key) DO UPDATE SET
          status='in_progress', owner_session=excluded.owner_session, unresolved=excluded.unresolved,
-         notes=excluded.notes, updated_at=excluded.updated_at
+         notes=excluded.notes, reclaimed_at=NULL, updated_at=excluded.updated_at
        WHERE NOT EXISTS (SELECT 1 FROM work_items w2 WHERE w2.canonical_key=excluded.canonical_key AND w2.status='in_progress' AND w2.id != excluded.id)`, [id, key, opts.summary ?? "", opts.unresolved ?? "", opts.notes ?? "", opts.ownerSession, opts.parentKey ?? null, opts.source ?? "agent", now, now]);
   } catch {
     const ip = db.query("SELECT * FROM work_items WHERE canonical_key=? AND status='in_progress'").get(key);
     if (ip)
       return { ok: false, inProgress: ip };
     try {
-      db.run("UPDATE work_items SET status='in_progress', owner_session=?, unresolved=?, notes=?, updated_at=? WHERE canonical_key=? AND NOT EXISTS (SELECT 1 FROM work_items w2 WHERE w2.canonical_key=? AND w2.status='in_progress' AND w2.id != work_items.id)", [opts.ownerSession, opts.unresolved ?? "", opts.notes ?? "", now, key, key]);
+      db.run("UPDATE work_items SET status='in_progress', owner_session=?, unresolved=?, notes=?, reclaimed_at=NULL, updated_at=? WHERE canonical_key=? AND NOT EXISTS (SELECT 1 FROM work_items w2 WHERE w2.canonical_key=? AND w2.status='in_progress' AND w2.id != work_items.id)", [opts.ownerSession, opts.unresolved ?? "", opts.notes ?? "", now, key, key]);
     } catch {
       const ip2 = db.query("SELECT * FROM work_items WHERE canonical_key=? AND status='in_progress'").get(key);
       if (ip2)
@@ -175,6 +204,12 @@ function ftsQuery(key) {
   if (toks.length === 0)
     return '""';
   return toks.map((t) => `"${t}"`).join(" OR ");
+}
+function readFirstFor(db, key, fts) {
+  if (fts) {
+    return db.query("SELECT path FROM markdown_fts WHERE markdown_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)).map((r) => r.path);
+  }
+  return db.query("SELECT path FROM markdown_fts WHERE path LIKE ? OR title LIKE ? LIMIT 6").all(`%${key}%`, `%${key}%`).map((r) => r.path);
 }
 var MIN_SEMANTIC_OVERLAP = 3;
 var STOPWORDS = new Set([
@@ -336,7 +371,50 @@ function maybeSyncFts(db, fts) {
     db.run("INSERT INTO meta (key, value) VALUES ('last_fts_sync', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [`${st.n}|${st.m}`]);
   }
 }
+function reclaimWorkItem(db, opts) {
+  const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
+  if (!item)
+    return { ok: false, reason: `ticket not found: ${opts.ticket}` };
+  if (item.status !== "in_progress")
+    return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${item.status})` };
+  if (item.reclaimed_at)
+    return { ok: false, reason: `ticket ${opts.ticket} was already reclaimed at ${item.reclaimed_at}` };
+  const key = normalizeKey(opts.task);
+  const overlap = tokenOverlap(key, `${item.canonical_key} ${item.summary} ${item.unresolved}`);
+  if (key !== item.canonical_key && overlap < MIN_SEMANTIC_OVERLAP) {
+    return { ok: false, reason: `reclaim denied: requested work does not correspond to ticket ${opts.ticket} (canonical_key=${item.canonical_key}, overlap=${overlap})` };
+  }
+  const now = nowIso();
+  const prevOwner = item.owner_session;
+  const historyNote = `[reclaim] ${now} by ${opts.ownerSession} from ${prevOwner ?? "none"}`;
+  const notes = [item.notes, historyNote].filter(Boolean).join(`
+`);
+  const res = db.run("UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=? WHERE id=? AND status='in_progress' AND reclaimed_at IS NULL", [opts.ownerSession, notes, now, now, opts.ticket]);
+  if (res.changes === 0) {
+    const cur = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
+    if (!cur)
+      return { ok: false, reason: `ticket not found: ${opts.ticket}` };
+    if (cur.status !== "in_progress")
+      return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${cur.status})` };
+    return { ok: false, reason: `reclaim lost: ticket ${opts.ticket} was already reclaimed by ${cur.owner_session ?? "?"} at ${cur.reclaimed_at ?? "?"}` };
+  }
+  return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket), previous_owner: prevOwner, reclaimed_at: now };
+}
 function preflight(db, opts) {
+  if (opts.reclaimTicket) {
+    const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, task: opts.task, ownerSession: opts.ownerSession });
+    if (r.ok) {
+      const key = normalizeKey(opts.task);
+      const readFirst = readFirstFor(db, key, opts.fts);
+      const sc = ensureScratch(projectScratchBase(opts.projectDir), r.item.id);
+      return { status: "NEW", ticket: r.item.id, canonical_key: r.item.canonical_key, requested_key: key, matched_key: r.item.canonical_key, match_reason: "reclaimed", summary: r.item.summary, established: r.item.summary ? [r.item.summary] : [], do_not_repeat: [], unresolved: r.item.unresolved ? [r.item.unresolved] : [], evidence: evidenceFor(db, r.item.id).slice(0, 10), read_first: readFirst, scratch: sc, owner_session: opts.ownerSession, candidates: [], reclaimed: { previous_owner: r.previous_owner, reclaimed_at: r.reclaimed_at } };
+    }
+    const res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts });
+    return { ...res, reclaim_error: r.reason };
+  }
+  return preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts });
+}
+function preflightCore(db, opts) {
   const key = normalizeKey(opts.task);
   maybeSyncFts(db, opts.fts);
   const fts = opts.fts;
@@ -364,12 +442,7 @@ function preflight(db, opts) {
     const like = `%${key}%`;
     candidates = db.query("SELECT * FROM work_items WHERE canonical_key LIKE ? OR summary LIKE ? OR unresolved LIKE ? LIMIT 6").all(like, like, like);
   }
-  let readFirst = [];
-  if (fts) {
-    readFirst = db.query("SELECT path FROM markdown_fts WHERE markdown_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)).map((r) => r.path);
-  } else {
-    readFirst = db.query("SELECT path FROM markdown_fts WHERE path LIKE ? OR title LIKE ? LIMIT 6").all(`%${key}%`, `%${key}%`).map((r) => r.path);
-  }
+  const readFirst = readFirstFor(db, key, fts);
   const scratchBase = projectScratchBase(opts.projectDir);
   const cap = (a, n) => a.slice(0, n);
   if (item) {
@@ -383,7 +456,8 @@ function preflight(db, opts) {
       return { status: "COVERED", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, summary: item.summary, established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${item.canonical_key} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] };
     }
     if (opts.claim) {
-      const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" });
+      const priorNote = item.status === "failed" ? "prior failed attempt: " + [item.summary, item.notes].filter(Boolean).join(" | ") : "";
+      const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: priorNote, ownerSession: opts.ownerSession, source: "agent" });
       if (c.ok) {
         const sc = ensureScratch(scratchBase, c.item.id);
         return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] };
@@ -771,20 +845,24 @@ var project_memory_default = {
     return {
       tool: {
         project_preflight: tool({
-          description: "Check project memory before investigative delegation. Returns COVERED, PARTIAL, NEW, IN_PROGRESS, or MEMORY_ERROR plus relevant prior context. Pass returned context to the worker. claim=true reserves NEW/PARTIAL work.",
+          description: "Check project memory before investigative delegation. Returns COVERED, PARTIAL, NEW, IN_PROGRESS, or MEMORY_ERROR plus relevant context. Pass returned context to the worker. claim=true reserves NEW/PARTIAL work; reclaim_ticket explicitly reclaims an orphaned IN_PROGRESS ticket.",
           args: {
             task: tool.schema.string().describe("Work to check in project memory"),
-            claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)")
+            claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
+            reclaim_ticket: tool.schema.string().optional().describe("Explicitly reclaim this orphaned IN_PROGRESS ticket")
           },
           execute: async (args, tctx) => {
             if (!handle)
               return JSON.stringify({ status: "MEMORY_ERROR", canonical_key: normalizeKey(args.task), error: { message: "project memory unavailable", cause: "init failed" } }, null, 2);
             const agent = tctx.agent ?? "";
             const claim = args.claim !== false;
+            if (args.reclaim_ticket && !isPrimary(agent)) {
+              return JSON.stringify({ status: "ERROR", error: "reclaim requires a primary agent (" + PRIMARY_AGENTS.join(", ") + "); subagents may not reclaim claims" });
+            }
             if (claim && !isPrimary(agent)) {
               return JSON.stringify({ status: "ERROR", error: `claim requires a primary agent (${PRIMARY_AGENTS.join(", ")}); subagents may query with claim=false` });
             }
-            const { handle: h, result } = preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts });
+            const { handle: h, result } = preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts, reclaimTicket: args.reclaim_ticket });
             handle = h;
             return JSON.stringify(result, null, 2);
           }

@@ -133,5 +133,14 @@ check("G5 no tmp files left behind", tmpLeft === 0, `left=${tmpLeft}`)
   check("auth unknown agent cannot append failures", PM.canAppendFailure("", primaries) === false)
 }
 
+// 19: failed record → re-claimable as NEW on the SAME ticket (retry semantics)
+const c19 = PM.claimWorkItem(db, { canonicalKey: "widget failed retry", ownerSession: "ses_A", summary: "widget failed retry" })
+const t19 = c19.ok ? c19.item.id : c19.inProgress.id
+const rec19 = PM.recordResult(db, { ticket: t19, status: "failed", summary: "retry failed" })
+check("19 record failed ok", rec19.ok, JSON.stringify(rec19))
+r = PM.preflight(db, { task: "widget failed retry", claim: true, ownerSession: "ses_G", projectDir: dir, fts })
+check("19 failed → NEW same ticket", r.status === "NEW" && r.ticket === t19, JSON.stringify(r))
+check("19 count 1", (db.query("SELECT COUNT(*) AS n FROM work_items WHERE canonical_key='widget failed retry'").get() as any).n === 1)
+
 console.log(`\nRESULT: ${pass} pass, ${fail} fail`)
 process.exit(fail ? 1 : 0)

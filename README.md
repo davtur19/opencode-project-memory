@@ -29,7 +29,7 @@ Compatibility is claimed only for the OpenCode versions this plugin was tested w
 
 The plugin provides these tools:
 
-- `project_preflight`: Check whether a task is already covered. It returns a context packet.
+- `project_preflight`: Check whether a task is already covered. It returns a context packet.; reclaim_ticket explicitly reclaims an orphaned IN_PROGRESS ticket (primary agents only)
 - `project_goal_checkpoint`: Write the project goal state file.
 - `project_failure_append`: Append a failure to the failures file.
 - `project_record`: Record the result of a delegated work item.
@@ -75,6 +75,8 @@ Run these commands to test the plugin:
 ```bash
 bun test/test-lib.ts
 bun test/failclosed.ts
+bun test/test-reclaim.ts
+bun test/reclaim-race.ts
 bun test/claim-race.ts <db> <key> <who>
 ```
 

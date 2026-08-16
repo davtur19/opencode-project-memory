@@ -27,19 +27,21 @@ export default {
     return {
       tool: {
         project_preflight: tool({
-          description: "Check project memory before investigative delegation. Returns COVERED, PARTIAL, NEW, IN_PROGRESS, or MEMORY_ERROR plus relevant prior context. Pass returned context to the worker. claim=true reserves NEW/PARTIAL work.",
+          description: "Check project memory before investigative delegation. Returns COVERED, PARTIAL, NEW, IN_PROGRESS, or MEMORY_ERROR plus relevant context. Pass returned context to the worker. claim=true reserves NEW/PARTIAL work; reclaim_ticket explicitly reclaims an orphaned IN_PROGRESS ticket.",
           args: {
             task: tool.schema.string().describe("Work to check in project memory"),
             claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
+            reclaim_ticket: tool.schema.string().optional().describe("Explicitly reclaim this orphaned IN_PROGRESS ticket"),
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ status: "MEMORY_ERROR", canonical_key: PM.normalizeKey(args.task), error: { message: "project memory unavailable", cause: "init failed" } }, null, 2)
             const agent = tctx.agent ?? ""
             const claim = args.claim !== false
+            if (args.reclaim_ticket && !isPrimary(agent)) { return JSON.stringify({ status: "ERROR", error: "reclaim requires a primary agent (" + PRIMARY_AGENTS.join(", ") + "); subagents may not reclaim claims" }) }
             if (claim && !isPrimary(agent)) {
               return JSON.stringify({ status: "ERROR", error: `claim requires a primary agent (${PRIMARY_AGENTS.join(", ")}); subagents may query with claim=false` })
             }
-            const { handle: h, result } = PM.preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts })
+            const { handle: h, result } = PM.preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts, reclaimTicket: args.reclaim_ticket })
             handle = h
             return JSON.stringify(result, null, 2)
           },

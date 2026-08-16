@@ -33,7 +33,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS work_items (
   id TEXT PRIMARY KEY,
   canonical_key TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered')),
+  status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered','failed')),
   summary TEXT DEFAULT '',
   unresolved TEXT DEFAULT '',
   notes TEXT DEFAULT '',
@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS work_items (
   parent_key TEXT,
   source TEXT DEFAULT 'agent',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  reclaimed_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_key ON work_items(canonical_key);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_active ON work_items(canonical_key) WHERE status='in_progress';
@@ -78,7 +79,7 @@ export type DB = Database
 export type WorkItem = {
   id: string; canonical_key: string; status: string; summary: string; unresolved: string;
   notes: string; owner_session: string | null; parent_key: string | null; source: string;
-  created_at: string; updated_at: string
+  created_at: string; updated_at: string; reclaimed_at: string | null
 }
 
 export function openMemory(dbPath: string): Database {
@@ -101,7 +102,35 @@ export function openMemory(dbPath: string): Database {
   }
   db.exec("PRAGMA foreign_keys=ON;")
   db.exec(SCHEMA)
+  migrateSchema(db)
   return db
+}
+
+// ---------- schema migration (adds 'failed' status + reclaimed_at column) ----------
+export function migrateSchema(db: Database): void {
+  const sql = (db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get() as { sql: string } | undefined)?.sql ?? ""
+  if (sql.includes("'failed'")) return // already migrated / fresh DB
+  db.exec("PRAGMA foreign_keys=OFF")
+  try {
+    db.transaction(() => {
+      const sql2 = (db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get() as { sql: string } | undefined)?.sql ?? ""
+      if (sql2.includes("'failed'")) return
+      db.exec("CREATE TABLE work_items_new (id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('new','in_progress','done','blocked','covered','failed')), summary TEXT DEFAULT '', unresolved TEXT DEFAULT '', notes TEXT DEFAULT '', owner_session TEXT, parent_key TEXT, source TEXT DEFAULT 'agent', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reclaimed_at TEXT)")
+      db.run("INSERT INTO work_items_new (rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, reclaimed_at) SELECT rowid, id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at, NULL FROM work_items")
+      db.exec("DROP TABLE work_items")
+      db.exec("ALTER TABLE work_items_new RENAME TO work_items")
+    })()
+  } catch (e) {
+    const sql3 = (db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_items'").get() as { sql: string } | undefined)?.sql ?? ""
+    if (!sql3.includes("'failed'")) throw e
+    // a concurrent migration won — swallow
+  } finally {
+    db.exec("PRAGMA foreign_keys=ON")
+  }
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_key ON work_items(canonical_key)")
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_active ON work_items(canonical_key) WHERE status='in_progress'")
+  db.exec("CREATE INDEX IF NOT EXISTS idx_work_items_owner ON work_items(owner_session)")
+  db.run("DELETE FROM meta WHERE key='last_fts_sync'")
 }
 
 // FTS5 is optional: if unavailable (embedded sqlite without FTS), retrieval falls back to LIKE.
@@ -138,7 +167,7 @@ export function claimWorkItem(db: Database, opts: { canonicalKey: string; summar
        VALUES (?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(canonical_key) DO UPDATE SET
          status='in_progress', owner_session=excluded.owner_session, unresolved=excluded.unresolved,
-         notes=excluded.notes, updated_at=excluded.updated_at
+         notes=excluded.notes, reclaimed_at=NULL, updated_at=excluded.updated_at
        WHERE NOT EXISTS (SELECT 1 FROM work_items w2 WHERE w2.canonical_key=excluded.canonical_key AND w2.status='in_progress' AND w2.id != excluded.id)`,
       [id, key, opts.summary ?? "", opts.unresolved ?? "", opts.notes ?? "", opts.ownerSession, opts.parentKey ?? null, opts.source ?? "agent", now, now],
     )
@@ -147,7 +176,7 @@ export function claimWorkItem(db: Database, opts: { canonicalKey: string; summar
     if (ip) return { ok: false, inProgress: ip }
     // reopen race: retry once (0-row UPDATE is a silent no-op if another claimer won)
     try {
-      db.run("UPDATE work_items SET status='in_progress', owner_session=?, unresolved=?, notes=?, updated_at=? WHERE canonical_key=? AND NOT EXISTS (SELECT 1 FROM work_items w2 WHERE w2.canonical_key=? AND w2.status='in_progress' AND w2.id != work_items.id)", [opts.ownerSession, opts.unresolved ?? "", opts.notes ?? "", now, key, key])
+      db.run("UPDATE work_items SET status='in_progress', owner_session=?, unresolved=?, notes=?, reclaimed_at=NULL, updated_at=? WHERE canonical_key=? AND NOT EXISTS (SELECT 1 FROM work_items w2 WHERE w2.canonical_key=? AND w2.status='in_progress' AND w2.id != work_items.id)", [opts.ownerSession, opts.unresolved ?? "", opts.notes ?? "", now, key, key])
     } catch {
       const ip2 = db.query("SELECT * FROM work_items WHERE canonical_key=? AND status='in_progress'").get(key) as WorkItem | undefined
       if (ip2) return { ok: false, inProgress: ip2 }
@@ -184,6 +213,12 @@ function ftsQuery(key: string): string {
   const toks = key.split(" ").filter(Boolean)
   if (toks.length === 0) return '""'
   return toks.map((t) => `"${t}"`).join(" OR ")
+}
+function readFirstFor(db: Database, key: string, fts: boolean): string[] {
+  if (fts) {
+    return (db.query("SELECT path FROM markdown_fts WHERE markdown_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)) as { path: string }[]).map((r) => r.path)
+  }
+  return (db.query("SELECT path FROM markdown_fts WHERE path LIKE ? OR title LIKE ? LIMIT 6").all(`%${key}%`, `%${key}%`) as { path: string }[]).map((r) => r.path)
 }
 
 // ---------- semantic continuation gate ----------
@@ -238,6 +273,42 @@ export function maybeSyncFts(db: Database, fts: boolean) {
   }
 }
 
+// ---------- reclaim ----------
+export type ReclaimResult =
+  | { ok: true; item: WorkItem; previous_owner: string | null; reclaimed_at: string }
+  | { ok: false; reason: string }
+
+// Explicit reclaim of an orphaned/abandoned IN_PROGRESS claim.
+// The guarded UPDATE is a single atomic statement: concurrent reclaim attempts
+// serialize on the SQLite write lock and exactly one wins (the first sets
+// reclaimed_at; the rest match 0 rows and report the loss).
+export function reclaimWorkItem(db: Database, opts: { ticket: string; task: string; ownerSession: string }): ReclaimResult {
+  const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
+  if (!item) return { ok: false, reason: `ticket not found: ${opts.ticket}` }
+  if (item.status !== "in_progress") return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${item.status})` }
+  if (item.reclaimed_at) return { ok: false, reason: `ticket ${opts.ticket} was already reclaimed at ${item.reclaimed_at}` }
+  const key = normalizeKey(opts.task)
+  const overlap = tokenOverlap(key, `${item.canonical_key} ${item.summary} ${item.unresolved}`)
+  if (key !== item.canonical_key && overlap < MIN_SEMANTIC_OVERLAP) {
+    return { ok: false, reason: `reclaim denied: requested work does not correspond to ticket ${opts.ticket} (canonical_key=${item.canonical_key}, overlap=${overlap})` }
+  }
+  const now = nowIso()
+  const prevOwner = item.owner_session
+  const historyNote = `[reclaim] ${now} by ${opts.ownerSession} from ${prevOwner ?? "none"}`
+  const notes = [item.notes, historyNote].filter(Boolean).join("\n")
+  const res = db.run(
+    "UPDATE work_items SET owner_session=?, notes=?, reclaimed_at=?, updated_at=? WHERE id=? AND status='in_progress' AND reclaimed_at IS NULL",
+    [opts.ownerSession, notes, now, now, opts.ticket],
+  )
+  if (res.changes === 0) {
+    const cur = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
+    if (!cur) return { ok: false, reason: `ticket not found: ${opts.ticket}` }
+    if (cur.status !== "in_progress") return { ok: false, reason: `ticket ${opts.ticket} is not in_progress (status=${cur.status})` }
+    return { ok: false, reason: `reclaim lost: ticket ${opts.ticket} was already reclaimed by ${cur.owner_session ?? "?"} at ${cur.reclaimed_at ?? "?"}` }
+  }
+  return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem, previous_owner: prevOwner, reclaimed_at: now }
+}
+
 // ---------- preflight ----------
 export type PreflightStatus = "COVERED" | "PARTIAL" | "NEW" | "IN_PROGRESS"
 export type PreflightResult = {
@@ -258,10 +329,27 @@ export type PreflightResult = {
   read_first: string[]
   scratch?: string
   owner_session?: string
+  reclaimed?: { previous_owner: string | null; reclaimed_at: string }
+  reclaim_error?: string
   candidates: { key: string; status: string; id: string }[]
 }
 
-export function preflight(db: Database, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean }): PreflightResult {
+export function preflight(db: Database, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean; reclaimTicket?: string }): PreflightResult {
+  if (opts.reclaimTicket) {
+    const r = reclaimWorkItem(db, { ticket: opts.reclaimTicket, task: opts.task, ownerSession: opts.ownerSession })
+    if (r.ok) {
+      const key = normalizeKey(opts.task)
+      const readFirst = readFirstFor(db, key, opts.fts)
+      const sc = ensureScratch(projectScratchBase(opts.projectDir), r.item.id)
+      return { status: "NEW", ticket: r.item.id, canonical_key: r.item.canonical_key, requested_key: key, matched_key: r.item.canonical_key, match_reason: "reclaimed", summary: r.item.summary, established: r.item.summary ? [r.item.summary] : [], do_not_repeat: [], unresolved: r.item.unresolved ? [r.item.unresolved] : [], evidence: evidenceFor(db, r.item.id).slice(0, 10), read_first: readFirst, scratch: sc, owner_session: opts.ownerSession, candidates: [], reclaimed: { previous_owner: r.previous_owner, reclaimed_at: r.reclaimed_at } }
+    }
+    const res = preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts })
+    return { ...res, reclaim_error: r.reason }
+  }
+  return preflightCore(db, { task: opts.task, claim: opts.claim, ownerSession: opts.ownerSession, projectDir: opts.projectDir, fts: opts.fts })
+}
+
+export function preflightCore(db: Database, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean }): PreflightResult {
   const key = normalizeKey(opts.task)
   maybeSyncFts(db, opts.fts)
   const fts = opts.fts
@@ -286,12 +374,7 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
     const like = `%${key}%`
     candidates = db.query("SELECT * FROM work_items WHERE canonical_key LIKE ? OR summary LIKE ? OR unresolved LIKE ? LIMIT 6").all(like, like, like) as (WorkItem & { fts_rank?: number })[]
   }
-  let readFirst: string[] = []
-  if (fts) {
-    readFirst = (db.query("SELECT path FROM markdown_fts WHERE markdown_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)) as { path: string }[]).map((r) => r.path)
-  } else {
-    readFirst = (db.query("SELECT path FROM markdown_fts WHERE path LIKE ? OR title LIKE ? LIMIT 6").all(`%${key}%`, `%${key}%`) as { path: string }[]).map((r) => r.path)
-  }
+  const readFirst = readFirstFor(db, key, fts)
   const scratchBase = projectScratchBase(opts.projectDir)
   const cap = (a: string[], n: number) => a.slice(0, n)
 
@@ -304,9 +387,10 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
       if (item.status === "blocked") unresolved.unshift(`BLOCKED: ${item.summary}`)
       return { status: "COVERED", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, summary: item.summary, established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${item.canonical_key} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
     }
-    // status 'new' → claimable
+    // status 'new' / 'failed' → claimable
     if (opts.claim) {
-      const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" })
+      const priorNote = item.status === "failed" ? "prior failed attempt: " + [item.summary, item.notes].filter(Boolean).join(" | ") : ""
+      const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: priorNote, ownerSession: opts.ownerSession, source: "agent" })
       if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] } }
       return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [] }
     }
@@ -634,7 +718,7 @@ export type MemoryErrorResult = {
   error: { message: string; cause: string }
 }
 
-export function preflightSafe(handle: MemoryHandle, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean }): { handle: MemoryHandle; result: PreflightResult | MemoryErrorResult } {
+export function preflightSafe(handle: MemoryHandle, opts: { task: string; claim: boolean; ownerSession: string; projectDir: string; fts: boolean; reclaimTicket?: string }): { handle: MemoryHandle; result: PreflightResult | MemoryErrorResult } {
   const key = normalizeKey(opts.task)
   try {
     const { handle: h, value } = runWithRecovery(handle, (db) => preflight(db, opts))
