@@ -84,16 +84,28 @@ const claim = (db: PM.DB, key: string, owner: string) => {
   check("G5 no worker_session", r.worker_session === undefined, JSON.stringify(r))
 }
 
-// G6 — gate block message is loop-proof
+// G6 — gate block message distinguishes A) no valid work check vs B) work IN_PROGRESS
 {
   const { db, dir, fts } = freshDb("g6")
-  const g = PM.gateDecision(db, { sessionID: "ses_no_claim", args: { subagent_type: "subagent" } })
-  check("G6 block action", g.action === "block", JSON.stringify(g))
-  const reason = g.reason ?? ""
-  check("G6 mentions project_work_check", reason.includes("project_work_check"), reason)
-  check("G6 mentions IN_PROGRESS", reason.includes("IN_PROGRESS"), reason)
-  check("G6 mentions do NOT retry task", reason.includes("do NOT retry task"), reason)
-  check("G6 mentions task_id", reason.includes("task_id"), reason)
+  // A) no preflight at all → tells the model to run project_work_check, nothing about retrying task()
+  const gA = PM.gateDecision(db, { sessionID: "ses_no_claim", args: { subagent_type: "subagent" } })
+  check("G6a block action", gA.action === "block", JSON.stringify(gA))
+  const reasonA = gA.reason ?? ""
+  check("G6a says Run project_work_check", reasonA.includes("Run project_work_check"), reasonA)
+  check("G6a does NOT mention retry task", !reasonA.includes("retry task"), reasonA)
+  check("G6a does NOT mention IN_PROGRESS", !reasonA.includes("IN_PROGRESS"), reasonA)
+  // B) last preflight returned IN_PROGRESS (e.g. claimed by another primary) →
+  //    do NOT tell the model to repeat project_work_check, follow next_action instead
+  const t6 = claim(db, "task g6", "ses_other")
+  PM.preflight(db, { task: "task g6", claim: true, ownerSession: "ses_me", projectDir: dir, fts })
+  const gB = PM.gateDecision(db, { sessionID: "ses_me", args: { subagent_type: "subagent" } })
+  check("G6b block action", gB.action === "block", JSON.stringify(gB))
+  const reasonB = gB.reason ?? ""
+  check("G6b says already in progress", reasonB.includes("already in progress"), reasonB)
+  check("G6b says Do not retry task", reasonB.includes("Do not retry task"), reasonB)
+  check("G6b says Follow next_action", reasonB.includes("next_action"), reasonB)
+  check("G6b does NOT repeat Run project_work_check", !reasonB.includes("Run project_work_check"), reasonB)
+  check("G6b ticket preserved on claim", t6 !== undefined)
 }
 
 // G7 — reclaim still works after binding (target the parent, who kept the claim)
@@ -148,6 +160,56 @@ const claim = (db: PM.DB, key: string, owner: string) => {
   const mig1b = dbM2.query("SELECT * FROM work_items WHERE id='g8m1'").get() as any
   check("G8 reopen preserved (idempotent)", mig1b?.canonical_key === "legacy g8 task" && mig1b?.status === "in_progress", JSON.stringify(mig1b))
   dbM2.close()
+}
+
+// G9 — next_action protocol on NEW / PARTIAL / COVERED
+{
+  const { db, dir, fts } = freshDb("g9")
+  // NEW (claim created) → DELEGATE
+  const rNew = PM.preflight(db, { task: "task g9a", claim: true, ownerSession: "ses_me", projectDir: dir, fts })
+  check("G9 NEW status", rNew.status === "NEW", JSON.stringify(rNew))
+  check("G9 NEW next_action DELEGATE", rNew.next_action === "DELEGATE", JSON.stringify(rNew))
+  // COVERED → USE_EXISTING
+  PM.recordResult(db, { ticket: rNew.ticket!, status: "done", summary: "task g9a done" })
+  const rCovered = PM.preflight(db, { task: "task g9a", claim: true, ownerSession: "ses_me", projectDir: dir, fts })
+  check("G9 COVERED status", rCovered.status === "COVERED", JSON.stringify(rCovered))
+  check("G9 COVERED next_action USE_EXISTING", rCovered.next_action === "USE_EXISTING", JSON.stringify(rCovered))
+  // PARTIAL (parent exists) → DELEGATE_DELTA
+  const p = claim(db, "task g9b", "ses_parent")
+  PM.recordResult(db, { ticket: p, status: "blocked", summary: "task g9b partial", unresolved: "remaining part" })
+  const rPartial = PM.preflight(db, { task: "task g9b remaining part", claim: true, ownerSession: "ses_me", projectDir: dir, fts })
+  check("G9 PARTIAL status", rPartial.status === "PARTIAL", JSON.stringify(rPartial))
+  check("G9 PARTIAL next_action DELEGATE_DELTA", rPartial.next_action === "DELEGATE_DELTA", JSON.stringify(rPartial))
+  // IN_PROGRESS with a bound worker → STEER (owner sees own worker)
+  const t = claim(db, "task g9c", "ses_owner")
+  PM.bindClaimToChild(db, "ses_owner", "ses_child")
+  const rSteer = PM.preflight(db, { task: "task g9c", claim: true, ownerSession: "ses_owner", projectDir: dir, fts })
+  check("G9 IN_PROGRESS next_action STEER", rSteer.next_action === "STEER", JSON.stringify(rSteer))
+}
+
+// G10 — steering via task_id is allowed even with no claim; missing metadata is safe
+{
+  const { db, dir, fts } = freshDb("g10")
+  const g = PM.gateDecision(db, { sessionID: "ses_no_claim", args: { task_id: "ses_child" } })
+  check("G10 task_id steering allowed", g.action === "allow" && g.reason === "steering", JSON.stringify(g))
+  const gNoArgs = PM.gateDecision(db, { sessionID: "ses_no_claim", args: {} })
+  check("G10 empty args blocks safely", gNoArgs.action === "block", JSON.stringify(gNoArgs))
+}
+
+// G11 — duplicate worker protection: IN_PROGRESS from another primary keeps a
+// single claim and never silently spawns a second worker
+{
+  const { db, dir, fts } = freshDb("g11")
+  const t1 = claim(db, "task g11", "ses_primary_a")
+  PM.bindClaimToChild(db, "ses_primary_a", "ses_worker_a")
+  // another primary preflights the SAME work with claim=true
+  const r = PM.preflight(db, { task: "task g11", claim: true, ownerSession: "ses_primary_b", projectDir: dir, fts })
+  check("G11 IN_PROGRESS same ticket", r.status === "IN_PROGRESS" && r.ticket === t1, JSON.stringify(r))
+  const n = (db.query("SELECT COUNT(*) AS n FROM work_items WHERE canonical_key='task g11' AND status='in_progress'").get() as { n: number }).n
+  check("G11 single claim kept (no duplicate)", n === 1, `count=${n}`)
+  // its gate does NOT allow task() — no duplicate worker possible
+  const g = PM.gateDecision(db, { sessionID: "ses_primary_b", args: { subagent_type: "subagent" } })
+  check("G11 gate blocks second primary", g.action === "block", JSON.stringify(g))
 }
 
 console.log(`\nRESULT: ${pass} pass, ${fail} fail`)
