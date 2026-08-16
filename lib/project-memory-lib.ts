@@ -181,7 +181,10 @@ function evidenceFor(db: Database, itemId: string): string[] {
   return (db.query("SELECT path FROM evidence WHERE work_item_id=?").all(itemId) as { path: string }[]).map((r) => r.path)
 }
 function ftsQuery(key: string): string {
-  const toks = key.split(" ").filter(Boolean)
+  // Significant tokens only: stopwords ("the", "when", "for", ...) must not be
+  // part of the query, otherwise ANY ticket sharing a stopword pollutes the
+  // candidate list with semantically unrelated rows (overlap 0).
+  const toks = [...sigTokens(key)]
   if (toks.length === 0) return '""'
   return toks.map((t) => `"${t}"`).join(" OR ")
 }
@@ -193,7 +196,11 @@ function ftsQuery(key: string): string {
 // the candidate's stored text. FTS candidate membership alone (any single
 // shared token, e.g. "local") must never be enough — regression: an unrelated
 // active ticket was repeatedly returned for a different task.
-const MIN_SEMANTIC_OVERLAP = 2
+// Threshold 3 (not 2): two shared significant tokens are NEVER enough to prove
+// a continuation — e.g. "fix local project" vs "inspect local project" share
+// {local, project} but are different tasks. Requiring >= 3 distinct significant
+// shared tokens makes that false positive structurally impossible.
+const MIN_SEMANTIC_OVERLAP = 3
 const STOPWORDS = new Set([
   "a","an","and","are","as","at","be","been","by","for","from","in","into","is","it",
   "of","on","or","that","the","to","was","were","will","with","do","does","did","have",
@@ -245,6 +252,7 @@ export type PreflightResult = {
   match_reason?: string
   match_score?: number
   reuse_denied?: { id: string; key: string; overlap: number }[]
+  reuse_considered?: { id: string; key: string; overlap: number; selected: boolean }[]
   summary?: string
   established: string[]
   do_not_repeat: string[]
@@ -310,15 +318,20 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
 
   // Semantic continuation gate: reuse an active ticket ONLY when it really
   // corresponds to the requested task. FTS candidate membership alone (any
-  // single shared token) is never sufficient.
+  // single shared token) is never sufficient: a continuation needs at least
+  // MIN_SEMANTIC_OVERLAP distinct significant shared tokens. Every in_progress
+  // candidate is scored and the BEST one is gated — the decision must not
+  // depend on the arbitrary order of the candidates array.
   let reuseDenied: { id: string; key: string; overlap: number }[] = []
+  let reuseConsidered: { id: string; key: string; overlap: number; selected: boolean }[] = []
   const inProgressCandidates = candidates.filter((c) => c.status === "in_progress")
   if (inProgressCandidates.length > 0) {
     const scored = inProgressCandidates.map((c) => ({ c, overlap: tokenOverlap(key, `${c.canonical_key} ${c.summary} ${c.unresolved}`) }))
-    const best = scored.reduce((a, b) => (b.overlap > a.overlap ? b : a))
+    const best = scored.reduce((a, b) => (b.overlap > a.overlap || (b.overlap === a.overlap && (b.c.fts_rank ?? 0) < (a.c.fts_rank ?? 0)) ? b : a))
+    reuseConsidered = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap, selected: c.id === best.c.id }))
     if (best.overlap >= MIN_SEMANTIC_OVERLAP) {
       const c = best.c
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: c.fts_rank, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [] }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: best.overlap, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered }
     }
     reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap }))
   }
@@ -331,19 +344,19 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
     const cand = doneCandidates.map((c) => ({ key: c.canonical_key, status: c.status, id: c.id }))
     if (opts.claim) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: `delta of ${doneCandidates[0].canonical_key}`, ownerSession: opts.ownerSession, parentKey: doneCandidates[0].canonical_key, source: "agent" })
-      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined } }
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined }
+      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined } }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined }
     }
-    return { status: "PARTIAL", canonical_key: key, requested_key: key, match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined }
+    return { status: "PARTIAL", canonical_key: key, requested_key: key, match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined }
   }
 
   // NEW
   if (opts.claim) {
     const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" })
-    if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined } }
-    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined }
+    if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined } }
+    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined }
   }
-  return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined }
+  return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined }
 }
 // ---------- record ----------
 export function recordResult(db: Database, opts: { ticket: string; status: string; summary?: string; unresolved?: string; evidence?: string[]; facts?: { key: string; value: string }[] }): { ok: true; item: WorkItem } | { ok: false; reason: string } {

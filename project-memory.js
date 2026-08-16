@@ -171,12 +171,12 @@ function evidenceFor(db, itemId) {
   return db.query("SELECT path FROM evidence WHERE work_item_id=?").all(itemId).map((r) => r.path);
 }
 function ftsQuery(key) {
-  const toks = key.split(" ").filter(Boolean);
+  const toks = [...sigTokens(key)];
   if (toks.length === 0)
     return '""';
   return toks.map((t) => `"${t}"`).join(" OR ");
 }
-var MIN_SEMANTIC_OVERLAP = 2;
+var MIN_SEMANTIC_OVERLAP = 3;
 var STOPWORDS = new Set([
   "a",
   "an",
@@ -393,13 +393,15 @@ function preflight(db, opts) {
     return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] };
   }
   let reuseDenied = [];
+  let reuseConsidered = [];
   const inProgressCandidates = candidates.filter((c) => c.status === "in_progress");
   if (inProgressCandidates.length > 0) {
     const scored = inProgressCandidates.map((c) => ({ c, overlap: tokenOverlap(key, `${c.canonical_key} ${c.summary} ${c.unresolved}`) }));
-    const best = scored.reduce((a, b) => b.overlap > a.overlap ? b : a);
+    const best = scored.reduce((a, b) => b.overlap > a.overlap || b.overlap === a.overlap && (b.c.fts_rank ?? 0) < (a.c.fts_rank ?? 0) ? b : a);
+    reuseConsidered = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap, selected: c.id === best.c.id }));
     if (best.overlap >= MIN_SEMANTIC_OVERLAP) {
       const c = best.c;
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: c.fts_rank, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [] };
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: best.overlap, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [], reuse_considered: reuseConsidered };
     }
     reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap }));
   }
@@ -413,21 +415,21 @@ function preflight(db, opts) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: `delta of ${doneCandidates[0].canonical_key}`, ownerSession: opts.ownerSession, parentKey: doneCandidates[0].canonical_key, source: "agent" });
       if (c.ok) {
         const sc = ensureScratch(scratchBase, c.item.id);
-        return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined };
+        return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
       }
-      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined };
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
     }
-    return { status: "PARTIAL", canonical_key: key, requested_key: key, match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined };
+    return { status: "PARTIAL", canonical_key: key, requested_key: key, match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
   }
   if (opts.claim) {
     const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" });
     if (c.ok) {
       const sc = ensureScratch(scratchBase, c.item.id);
-      return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined };
+      return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
     }
-    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined };
+    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
   }
-  return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined };
+  return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined, reuse_considered: reuseConsidered.length ? reuseConsidered : undefined };
 }
 function recordResult(db, opts) {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
