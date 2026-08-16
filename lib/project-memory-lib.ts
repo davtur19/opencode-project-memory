@@ -652,7 +652,7 @@ export function gateDecision(db: Database, opts: { sessionID: string; args: { ta
   if (st === "vision" || st === "verifier") return { action: "allow", reason: `exempt: ${st}` }
   const claim = db.query("SELECT * FROM work_items WHERE owner_session=? AND status='in_progress' ORDER BY updated_at DESC LIMIT 1").get(opts.sessionID) as WorkItem | undefined
   if (claim) return { action: "allow", reason: "preflight ticket", ticket: claim.id }
-  return { action: "block", reason: "project-memory gate: no preflight ticket for this session. Run project_preflight(task=...) before delegating. (Set PROJECT_MEMORY_GATE=warn to relax.)" }
+  return { action: "block", reason: "project-memory gate: no preflight ticket for this session. Run project_work_check(work=...) before delegating. (Set PROJECT_MEMORY_GATE=warn to relax.)" }
 }
 
 // ---------- claim → child session binding (for steering via task_id) ----------

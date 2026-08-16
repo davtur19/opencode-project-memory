@@ -47,7 +47,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pm-failclosed-"))
   let threw = false, msg = ""
   try { await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_3", callID: "c1" }, { args: { subagent_type: "subagent", prompt: "x" } }) } catch (e: any) { threw = true; msg = e.message }
   check("T2b plugin gate blocks on init failure", threw && msg.includes("unavailable or inconclusive"), msg)
-  const pre = JSON.parse(await hooks.tool.project_preflight.execute({ task: "anything", claim: true }, { sessionID: "ses_3", agent: "orchestrator", directory: dir3 }))
+  const pre = JSON.parse(await hooks.tool.project_work_check.execute({ work: "anything", claim: true }, { sessionID: "ses_3", agent: "orchestrator", directory: dir3 }))
   check("T2b plugin preflight MEMORY_ERROR", pre.status === "MEMORY_ERROR" && !!pre.error?.message && !!pre.error?.cause, JSON.stringify(pre))
 }
 

@@ -1,4 +1,4 @@
-// project-memory.ts — opencode plugin: project memory preflight/gate/record
+// project-memory.ts — opencode plugin: project memory work/idea tools
 import { tool } from "@opencode-ai/plugin"
 import * as path from "node:path"
 import * as PM from "./lib/project-memory-lib"
@@ -28,16 +28,16 @@ export default {
 
     return {
       tool: {
-        project_preflight: tool({
-          description: "Check project memory before investigative delegation. Returns COVERED, PARTIAL, NEW, IN_PROGRESS, or MEMORY_ERROR plus relevant context. Pass returned context to the worker. claim=true reserves NEW/PARTIAL work; reclaim_ticket explicitly reclaims an orphaned IN_PROGRESS ticket.",
+        project_work_check: tool({
+          description: "Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress.",
           args: {
-            task: tool.schema.string().describe("Work to check in project memory"),
+            work: tool.schema.string().describe("Work to check in project memory"),
             claim: tool.schema.boolean().optional().describe("Reserve NEW/PARTIAL work (default true)"),
-            reclaim_ticket: tool.schema.string().optional().describe("Explicitly reclaim this orphaned IN_PROGRESS ticket"),
-            reclaim_owner: tool.schema.string().optional().describe("Expected current owner of the reclaim target (owner_session from the IN_PROGRESS preflight result); required with reclaim_ticket"),
+            reclaim_ticket: tool.schema.string().optional().describe("Reclaim this orphaned IN_PROGRESS ticket"),
+            reclaim_owner: tool.schema.string().optional().describe("Expected current owner of the reclaim target"),
           },
           execute: async (args: any, tctx: any) => {
-            if (!handle) return JSON.stringify({ status: "MEMORY_ERROR", canonical_key: PM.normalizeKey(args.task), error: { message: "project memory unavailable", cause: "init failed" } }, null, 2)
+            if (!handle) return JSON.stringify({ status: "MEMORY_ERROR", canonical_key: PM.normalizeKey(args.work), error: { message: "project memory unavailable", cause: "init failed" } }, null, 2)
             const agent = tctx.agent ?? ""
             const claim = args.claim !== false
             if (args.reclaim_ticket && !isPrimary(agent)) { return JSON.stringify({ status: "ERROR", error: "reclaim requires a primary agent (" + PRIMARY_AGENTS.join(", ") + "); subagents may not reclaim claims" }) }
@@ -45,20 +45,20 @@ export default {
             if (claim && !isPrimary(agent)) {
               return JSON.stringify({ status: "ERROR", error: `claim requires a primary agent (${PRIMARY_AGENTS.join(", ")}); subagents may query with claim=false` })
             }
-            const { handle: h, result } = PM.preflightSafe(handle, { task: args.task, claim, ownerSession: tctx.sessionID, projectDir: directory, fts, reclaimTicket: args.reclaim_ticket, reclaimOwner: args.reclaim_owner })
+            const { handle: h, result } = PM.preflightSafe(handle, { task: args.work, claim, ownerSession: tctx.sessionID, projectDir: directory, fts, reclaimTicket: args.reclaim_ticket, reclaimOwner: args.reclaim_owner })
             handle = h
             return JSON.stringify(result, null, 2)
           },
         }),
-        project_record: tool({
-          description: "Record the final result, evidence and reusable facts for a preflight ticket. Primary agents only.",
+        project_work_save: tool({
+          description: "Save durable results, evidence and reusable facts learned from work.",
           args: {
-            ticket: tool.schema.string().describe("Work item id from project_preflight"),
+            ticket: tool.schema.string().describe("Work item id from project_work_check"),
             status: tool.schema.enum(["done", "blocked", "failed"]),
-            summary: tool.schema.string().optional(),
+            summary: tool.schema.string().optional().describe("Result summary"),
             unresolved: tool.schema.string().optional().describe("Remaining unresolved delta, if any"),
             evidence: tool.schema.array(tool.schema.string()).optional().describe("File paths / report ids produced"),
-            facts: tool.schema.array(tool.schema.object({ key: tool.schema.string(), value: tool.schema.string() })).optional(),
+            facts: tool.schema.array(tool.schema.object({ key: tool.schema.string(), value: tool.schema.string() })).optional().describe("Reusable facts learned"),
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
@@ -72,17 +72,17 @@ export default {
             }
           },
         }),
-        project_goal_checkpoint: tool({
-          description: "Update the managed current-goal checkpoint while preserving goal-state history. Primary agents only.",
-          args: { content: tool.schema.string() },
+        project_goal_update: tool({
+          description: "Update goal progress worth preserving across compaction or continuation.",
+          args: { progress: tool.schema.string().describe("Goal progress to preserve") },
           execute: async (args: any, tctx: any) => {
-            if (!isPrimary(tctx.agent ?? "")) return JSON.stringify({ ok: false, error: "only primary agents can checkpoint goal-state" })
-            const res = PM.checkpointGoal(directory, args.content)
+            if (!isPrimary(tctx.agent ?? "")) return JSON.stringify({ ok: false, error: "only primary agents can update goal-state" })
+            const res = PM.checkpointGoal(directory, args.progress)
             return JSON.stringify({ ok: true, ...res })
           },
         }),
-        project_failure_append: tool({
-          description: "Record a reusable failure/blocker in project memory and FAILURES.md. Use only when it can prevent repeated wasted work.",
+        project_failure_save: tool({
+          description: "Save a reusable failure or blocker when it can prevent repeated wasted work.",
           args: {
             symptom: tool.schema.string().describe("What failed"),
             cause: tool.schema.string().describe("Known cause, or unknown"),
@@ -101,8 +101,8 @@ export default {
             }
           },
         }),
-        project_idea_record: tool({
-          description: "Create or update an idea, condition or relation in project idea memory. Primary agents only. Ideas are hypotheses, separate from established facts (work_items). Lifecycle statuses: proposed, testing, validated, disproven, dormant. BLOCKED/READY are DERIVED from requires-relations and unsatisfied conditions, never persisted. Relations kinds: requires, enables, supports, contradicts, combines_with, derived_from. Target references use 'idea:KEY' or 'condition:KEY' (prefix auto-creates missing targets). 'satisfies' marks conditions satisfied (e.g. when an idea/test is validated). Subagents cannot mutate idea memory — they report hypotheses to the orchestrator.",
+        project_idea_save: tool({
+          description: "Save or update a durable idea, prerequisite and its relations.",
           args: {
             idea: tool.schema.object({
               key: tool.schema.string().optional(),
@@ -112,24 +112,24 @@ export default {
               status: tool.schema.enum(["proposed", "testing", "validated", "disproven", "dormant"]).optional(),
               rationale: tool.schema.string().optional(),
               evidence: tool.schema.string().optional(),
-            }).optional(),
+            }).optional().describe("Idea to save or update"),
             conditions: tool.schema.array(tool.schema.object({
               key: tool.schema.string(),
               description: tool.schema.string().optional(),
               satisfied: tool.schema.boolean().optional(),
               satisfied_by: tool.schema.string().optional(),
-            })).optional(),
+            })).optional().describe("Prerequisites to save or update"),
             relations: tool.schema.array(tool.schema.object({
               idea: tool.schema.string(),
               kind: tool.schema.enum(PM2.RELATION_KINDS as unknown as [string, ...string[]]),
               target: tool.schema.string(),
-            })).optional(),
-            satisfies: tool.schema.array(tool.schema.string()).optional(),
+            })).optional().describe("Relations to add"),
+            satisfies: tool.schema.array(tool.schema.string()).optional().describe("Condition keys this idea satisfies"),
             remove_relations: tool.schema.array(tool.schema.object({
               idea: tool.schema.string(),
               kind: tool.schema.enum(PM2.RELATION_KINDS as unknown as [string, ...string[]]),
               target: tool.schema.string(),
-            })).optional(),
+            })).optional().describe("Relations to remove"),
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
@@ -137,22 +137,23 @@ export default {
             try {
               return JSON.stringify(PM2.ideaRecord(handle.db, args))
             } catch (e: any) {
-              return JSON.stringify({ ok: false, error: `idea_record failed: ${e?.message ?? e}` })
+              return JSON.stringify({ ok: false, error: `idea_save failed: ${e?.message ?? e}` })
             }
           },
         }),
-        project_frontier: tool({
-          description: "Recall a small bounded set of relevant ideas for a goal: actionable/blocked/testing/validated/disproven ideas, open conditions and useful relations. Read-only; usable by any agent. Derived state: an idea is 'ready' when it has no unsatisfied required condition and no non-validated/disproven required idea; 'blocked' otherwise. Disproven ideas are remembered but never actionable.",
+        project_idea_search: tool({
+          description: "Search durable project ideas, prerequisites and relations relevant to exploratory work.",
           args: {
-            goal: tool.schema.string().describe("Goal/topic to search for in idea memory"),
+            query: tool.schema.string().describe("Goal/topic to search for in idea memory"),
             limit: tool.schema.number().int().min(1).max(20).optional().describe("Max ideas to return (default 8)"),
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
+            if (tctx.agent === "subagent") return JSON.stringify({ ok: false, error: "subagents may not search idea memory (report hypotheses to the orchestrator)" })
             try {
-              return JSON.stringify(PM2.projectFrontier(handle.db, args))
+              return JSON.stringify(PM2.projectFrontier(handle.db, { goal: args.query, limit: args.limit }))
             } catch (e: any) {
-              return JSON.stringify({ ok: false, error: `frontier failed: ${e?.message ?? e}` })
+              return JSON.stringify({ ok: false, error: `idea_search failed: ${e?.message ?? e}` })
             }
           },
         }),

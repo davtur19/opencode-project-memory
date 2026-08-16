@@ -1,54 +1,43 @@
 # opencode-project-memory
 
-This plugin gives persistent project memory to OpenCode agents.
+Persistent project memory for OpenCode agents. The plugin stores state in a local SQLite database and exposes six tools.
 
-The plugin stores project facts, work items, and failures in a local SQLite database. It prevents duplicate investigative work. It keeps the project state across sessions.
+The plugin persists and retrieves state. The LLM generates, combines and chooses ideas. There is no DAG, no scheduler, no graph database and no embeddings.
 
-## Why
+## What it stores
 
-Investigative subagents often repeat the same work. The plugin solves these problems:
-
-- Duplicate investigations: The preflight check detects work that is already covered.
-- Concurrent claims: The atomic claim prevents two agents from owning the same work item.
-- Stale or missing context: The goal state file and the memory database keep the context across sessions.
-- Shared-state races: The serialized writers prevent concurrent writes to the same files.
-
-## Requirements
-
-- OpenCode with plugin/custom-tool API support.
-- Bun runtime.
-- SQLite with FTS5 support.
-
-Background subagents are not required for memory and preflight themselves. The recommended async orchestration workflow — task(background=true) for independent work and task_id to continue or steer an existing worker — requires an OpenCode version with native background subagent support. Enable it with:
-
-OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
-
-Compatibility is claimed only for the OpenCode versions this plugin was tested with.
+- **V1 — work memory**: work items, findings, evidence and reusable facts. It prevents duplicate investigative work and keeps project state across sessions.
+- **V2 — idea memory**: ideas (hypotheses), prerequisites (conditions) and their relations. Ideas are separate from established facts.
 
 ## Tools
 
-The plugin provides these tools:
+- `project_work_check`: Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress.
+- `project_work_save`: Save durable results, evidence and reusable facts learned from work.
+- `project_failure_save`: Save a reusable failure or blocker when it can prevent repeated wasted work.
+- `project_goal_update`: Update goal progress worth preserving across compaction or continuation.
+- `project_idea_search`: Search durable project ideas, prerequisites and relations relevant to exploratory work.
+- `project_idea_save`: Save or update a durable idea, prerequisite and its relations.
 
-- `project_preflight`: Check whether a task is already covered. It returns a context packet.; reclaim_ticket + reclaim_owner explicitly reclaims an orphaned IN_PROGRESS ticket (primary agents only, owner from the IN_PROGRESS result)
-- `project_goal_checkpoint`: Write the project goal state file.
-- `project_failure_append`: Append a failure to the failures file.
-- `project_record`: Record the result of a delegated work item.
+## Work loop (V1)
 
-## Idea memory (V2)
+1. Before investigative work, call `project_work_check(work=...)`.
+2. Do not repeat COVERED or IN_PROGRESS work. For PARTIAL work, do only the unresolved delta.
+3. Run independent work with `task(background=true)`. Steer an existing worker via its `task_id`.
+4. Save the result with `project_work_save(ticket=..., status=..., summary=..., evidence=..., facts=...)`.
 
-Project-Memory V2 adds a separate idea frontier, orthogonal to the V1 work-item facts:
+## Idea loop (V2)
 
-- `project_frontier(goal, limit?)`: recall a small bounded set of relevant actionable/blocked/testing/validated/disproven ideas, open conditions and useful relations (read-only; usable by any agent).
-- `project_idea_record(...)`: create/update ideas, conditions and relations (primary agents only).
+1. Before generating exploratory hypotheses, call `project_idea_search(query=...)`.
+2. Preserve materially distinct useful ideas with `project_idea_save(...)`.
+3. BLOCKED is not the same as DISPROVEN. Confirmed state changes require evidence.
+4. Relation kinds: `requires`, `enables`, `supports`, `contradicts`, `combines_with`, `derived_from`.
+5. Idea lifecycle: `proposed`, `testing`, `validated`, `disproven`, `dormant`.
 
-Concepts:
+## Permissions
 
-- Ideas are hypotheses separate from established facts; conditions are prerequisites.
-- Relation kinds: `requires`, `enables`, `supports`, `contradicts`, `combines_with`, `derived_from`.
-- Idea lifecycle: `proposed`, `testing`, `validated`, `disproven`, `dormant`.
-- BLOCKED/READY are DERIVED from `requires`-relations (never persisted); BLOCKED is not the same as DISPROVEN.
-
-Migration: V2 is additive — new tables `ideas`, `conditions`, `idea_relations`, optional `idea_fts`; existing V1 databases are upgraded automatically on open; no destructive changes.
+- `orchestrator` / `orchestrator-goal`: idea search and idea save allowed.
+- `subagent`: idea search and idea save denied; failure save allowed.
+- `verifier` / `vision`: project-memory mutation denied.
 
 ## Fail-closed behavior
 
@@ -56,10 +45,23 @@ Migration: V2 is additive — new tables `ideas`, `conditions`, `idea_relations`
 - A memory error returns MEMORY_ERROR. The gate blocks the investigative task.
 - The tools `vision` and `verifier` are exempt. Steering via `task_id` is exempt.
 
+## Requirements
+
+- OpenCode with plugin/custom-tool API support.
+- Bun runtime.
+- SQLite with FTS5 support.
+
+Background subagents are not required for memory and preflight themselves. The recommended async orchestration workflow — `task(background=true)` for independent work and `task_id` to continue or steer an existing worker — requires an OpenCode version with native background subagent support. Enable it with:
+
+OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
+
+Compatibility is claimed only for the OpenCode versions this plugin was tested with.
+
 ## Files
 
 - `project-memory.ts`: The plugin entry point.
 - `lib/project-memory-lib.ts`: The core logic. It contains the schema, the FTS5 search with LIKE fallback, the atomic claim, the preflight, the bootstrap, the gate, and the fail-closed recovery.
+- `lib/project-memory-v2.ts`: The V2 idea memory core.
 - `test/`: The standalone tests for Bun.
 
 ## Build
