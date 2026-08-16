@@ -822,6 +822,426 @@ function gateSafe(handle, opts) {
   }
 }
 
+// lib/project-memory-v2.ts
+var IDEA_STATUSES = ["proposed", "testing", "validated", "disproven", "dormant"];
+var RELATION_KINDS = ["requires", "enables", "supports", "contradicts", "combines_with", "derived_from"];
+var V2_SCHEMA = `
+CREATE TABLE IF NOT EXISTS ideas (
+  id TEXT PRIMARY KEY,
+  canonical_key TEXT NOT NULL UNIQUE,
+  title TEXT DEFAULT '',
+  summary TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','testing','validated','disproven','dormant')),
+  rationale TEXT DEFAULT '',
+  evidence TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conditions (
+  id TEXT PRIMARY KEY,
+  canonical_key TEXT NOT NULL UNIQUE,
+  description TEXT DEFAULT '',
+  satisfied INTEGER NOT NULL DEFAULT 0,
+  satisfied_by TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS idea_relations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  idea_id TEXT NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('requires','enables','supports','contradicts','combines_with','derived_from')),
+  target_type TEXT NOT NULL CHECK (target_type IN ('idea','condition')),
+  target_id TEXT NOT NULL,
+  note TEXT DEFAULT '',
+  UNIQUE(idea_id, kind, target_type, target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_relations_idea ON idea_relations(idea_id);
+CREATE INDEX IF NOT EXISTS idx_relations_target ON idea_relations(target_type, target_id);
+`;
+function ensureV2Schema(db, fts) {
+  db.exec(V2_SCHEMA);
+  if (fts) {
+    try {
+      db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS idea_fts USING fts5(canonical_key, title, summary, rationale)");
+    } catch {}
+  }
+}
+function ftsQueryV2(key) {
+  const toks = key.split(" ").filter(Boolean);
+  if (toks.length === 0)
+    return '""';
+  return toks.map((t) => `"${t}"`).join(" OR ");
+}
+function ideaFtsExists(db) {
+  try {
+    return !!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='idea_fts'").get();
+  } catch {
+    return false;
+  }
+}
+function syncIdeaFts(db, ideaId) {
+  try {
+    if (!ideaFtsExists(db))
+      return;
+    const r = db.query("SELECT rowid, canonical_key, title, summary, rationale FROM ideas WHERE id=?").get(ideaId);
+    if (!r)
+      return;
+    db.run("DELETE FROM idea_fts WHERE rowid=?", [r.rowid]);
+    db.run("INSERT INTO idea_fts(rowid, canonical_key, title, summary, rationale) VALUES (?,?,?,?,?)", [r.rowid, r.canonical_key, r.title, r.summary, r.rationale]);
+  } catch {}
+}
+function resolveIdea(db, ref) {
+  if (typeof ref !== "string" || !ref)
+    return null;
+  const byId = db.query("SELECT * FROM ideas WHERE id=?").get(ref);
+  if (byId)
+    return { id: byId.id, canonical_key: byId.canonical_key };
+  const k = normalizeKey(ref);
+  if (!k)
+    return null;
+  const byKey = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(k);
+  if (byKey)
+    return { id: byKey.id, canonical_key: byKey.canonical_key };
+  return null;
+}
+function resolveTarget(db, target, autoCreate) {
+  if (typeof target !== "string" || !target)
+    return null;
+  if (target.startsWith("condition:")) {
+    const k2 = normalizeKey(target.slice("condition:".length));
+    if (!k2)
+      return null;
+    let row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k2);
+    if (!row && autoCreate) {
+      const id = ulid();
+      const now = nowIso();
+      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,0,'',?,?)", [id, k2, k2, now, now]);
+      row = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k2);
+    }
+    if (!row)
+      return null;
+    return { target_type: "condition", target_id: row.id, target_key: row.canonical_key };
+  }
+  if (target.startsWith("idea:")) {
+    const k2 = normalizeKey(target.slice("idea:".length));
+    if (!k2)
+      return null;
+    let row = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(k2);
+    if (!row && autoCreate) {
+      const id = ulid();
+      const now = nowIso();
+      db.run("INSERT INTO ideas (id, canonical_key, title, summary, status, rationale, evidence, created_at, updated_at) VALUES (?,?,?,?,'proposed','','',?,?)", [id, k2, k2, "", now, now]);
+      row = db.query("SELECT * FROM ideas WHERE id=?").get(id);
+    }
+    if (!row)
+      return null;
+    return { target_type: "idea", target_id: row.id, target_key: row.canonical_key };
+  }
+  const byIdeaId = db.query("SELECT * FROM ideas WHERE id=?").get(target);
+  if (byIdeaId)
+    return { target_type: "idea", target_id: byIdeaId.id, target_key: byIdeaId.canonical_key };
+  const k = normalizeKey(target);
+  if (!k)
+    return null;
+  const byIdeaKey = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(k);
+  if (byIdeaKey)
+    return { target_type: "idea", target_id: byIdeaKey.id, target_key: byIdeaKey.canonical_key };
+  const byCondId = db.query("SELECT * FROM conditions WHERE id=?").get(target);
+  if (byCondId)
+    return { target_type: "condition", target_id: byCondId.id, target_key: byCondId.canonical_key };
+  const byCondKey = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(k);
+  if (byCondKey)
+    return { target_type: "condition", target_id: byCondKey.id, target_key: byCondKey.canonical_key };
+  return null;
+}
+function derivedStateFor(db, ideaId) {
+  const idea = db.query("SELECT * FROM ideas WHERE id=?").get(ideaId);
+  if (!idea)
+    return { derived: "proposed", blockers: [] };
+  if (idea.status !== "proposed")
+    return { derived: idea.status, blockers: [] };
+  const blockers = [];
+  const reqs = db.query("SELECT * FROM idea_relations WHERE idea_id=? AND kind='requires'").all(ideaId);
+  for (const r of reqs) {
+    if (r.target_type === "condition") {
+      const c = db.query("SELECT * FROM conditions WHERE id=?").get(r.target_id);
+      if (!c || c.satisfied !== 1) {
+        blockers.push({ type: "condition", key: c?.canonical_key ?? r.target_id, note: "condition unsatisfied" });
+      }
+    } else {
+      const t = db.query("SELECT * FROM ideas WHERE id=?").get(r.target_id);
+      if (!t)
+        blockers.push({ type: "idea", key: r.target_id, note: "required idea missing" });
+      else if (t.status === "disproven")
+        blockers.push({ type: "idea", key: t.canonical_key, note: "required idea disproven" });
+      else if (t.status !== "validated")
+        blockers.push({ type: "idea", key: t.canonical_key, note: "required idea not validated" });
+    }
+  }
+  return { derived: blockers.length ? "blocked" : "ready", blockers };
+}
+function ideaRecord(db, opts = {}) {
+  const errors = [];
+  const ideaOpts = { ...opts.idea ?? {} };
+  if (opts.status !== undefined && ideaOpts.status === undefined)
+    ideaOpts.status = opts.status;
+  const hasId = typeof ideaOpts.id === "string" && ideaOpts.id.length > 0;
+  let key = "";
+  let existingRow;
+  if (hasId) {
+    existingRow = db.query("SELECT * FROM ideas WHERE id=?").get(ideaOpts.id);
+    if (!existingRow)
+      return { ok: false, error: `idea not found by id: ${ideaOpts.id}` };
+    key = existingRow.canonical_key;
+  } else {
+    key = normalizeKey(typeof ideaOpts.key === "string" ? ideaOpts.key : "");
+    if (!key)
+      return { ok: false, error: "idea.key or idea.id required" };
+    existingRow = db.query("SELECT * FROM ideas WHERE canonical_key=?").get(key);
+  }
+  let statusProvided = false;
+  if (typeof ideaOpts.status === "string" && ideaOpts.status !== "") {
+    if (IDEA_STATUSES.includes(ideaOpts.status))
+      statusProvided = true;
+    else
+      errors.push(`invalid idea status '${ideaOpts.status}' (expected one of: ${IDEA_STATUSES.join(", ")})`);
+  }
+  const now = nowIso();
+  const ideaId = existingRow?.id ?? ulid();
+  if (existingRow) {
+    const sets = [];
+    const vals = [];
+    for (const col of ["title", "summary", "rationale", "evidence"]) {
+      if (typeof ideaOpts[col] === "string") {
+        sets.push(`${col}=?`);
+        vals.push(ideaOpts[col]);
+      }
+    }
+    if (statusProvided) {
+      sets.push("status=?");
+      vals.push(ideaOpts.status);
+    }
+    sets.push("updated_at=?");
+    vals.push(now);
+    db.run(`UPDATE ideas SET ${sets.join(", ")} WHERE id=?`, [...vals, existingRow.id]);
+  } else {
+    db.run(`INSERT INTO ideas (id, canonical_key, title, summary, status, rationale, evidence, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?)`, [
+      ideaId,
+      key,
+      typeof ideaOpts.title === "string" ? ideaOpts.title : "",
+      typeof ideaOpts.summary === "string" ? ideaOpts.summary : "",
+      statusProvided ? ideaOpts.status : "proposed",
+      typeof ideaOpts.rationale === "string" ? ideaOpts.rationale : "",
+      typeof ideaOpts.evidence === "string" ? ideaOpts.evidence : "",
+      now,
+      now
+    ]);
+  }
+  syncIdeaFts(db, ideaId);
+  const condTouched = new Map;
+  for (const c of opts.conditions ?? []) {
+    const ckey = normalizeKey(typeof c.key === "string" ? c.key : "");
+    if (!ckey) {
+      errors.push(`condition key required (got ${JSON.stringify(c.key)})`);
+      continue;
+    }
+    const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(ckey);
+    const cid = existing?.id ?? ulid();
+    const desc = typeof c.description === "string" ? c.description : existing?.description ?? "";
+    let satisfied;
+    let satisfiedBy;
+    if (typeof c.satisfied === "boolean") {
+      satisfied = c.satisfied ? 1 : 0;
+      satisfiedBy = c.satisfied ? typeof c.satisfied_by === "string" && c.satisfied_by !== "" ? c.satisfied_by : existing?.satisfied_by ?? "orchestrator" : "";
+    } else {
+      satisfied = existing?.satisfied ?? 0;
+      satisfiedBy = existing?.satisfied_by ?? "";
+    }
+    const sets = [];
+    const vals = [];
+    if (typeof c.description === "string") {
+      sets.push("description=?");
+      vals.push(c.description);
+    }
+    if (typeof c.satisfied === "boolean") {
+      sets.push("satisfied=?");
+      vals.push(satisfied);
+      sets.push("satisfied_by=?");
+      vals.push(satisfiedBy);
+    }
+    sets.push("updated_at=?");
+    vals.push(now);
+    if (existing) {
+      db.run(`UPDATE conditions SET ${sets.join(", ")} WHERE id=?`, [...vals, existing.id]);
+    } else {
+      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?)", [cid, ckey, desc, satisfied, satisfiedBy, now, now]);
+    }
+    condTouched.set(ckey, { key: ckey, description: desc, satisfied: satisfied === 1, satisfied_by: satisfiedBy });
+  }
+  for (const s of opts.satisfies ?? []) {
+    const skey = normalizeKey(typeof s === "string" ? s : "");
+    if (!skey) {
+      errors.push(`satisfies key required (got ${JSON.stringify(s)})`);
+      continue;
+    }
+    const existing = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(skey);
+    const cid = existing?.id ?? ulid();
+    const satisfiedBy = key;
+    const desc = existing?.description ?? skey;
+    const now2 = nowIso();
+    if (existing) {
+      db.run("UPDATE conditions SET satisfied=1, satisfied_by=?, updated_at=? WHERE id=?", [satisfiedBy, now2, existing.id]);
+    } else {
+      db.run("INSERT INTO conditions (id, canonical_key, description, satisfied, satisfied_by, created_at, updated_at) VALUES (?,?,?,1,?,?,?)", [cid, skey, desc, satisfiedBy, now2, now2]);
+    }
+    condTouched.set(skey, { key: skey, description: desc, satisfied: true, satisfied_by: satisfiedBy });
+  }
+  const addedRelations = [];
+  for (const r of opts.relations ?? []) {
+    const src = resolveIdea(db, r.idea);
+    if (!src) {
+      errors.push(`relation source idea not found: ${r.idea}`);
+      continue;
+    }
+    if (!RELATION_KINDS.includes(r.kind)) {
+      errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`);
+      continue;
+    }
+    const tr = resolveTarget(db, r.target, true);
+    if (!tr) {
+      errors.push(`relation target not found: ${r.target}`);
+      continue;
+    }
+    const res = db.run("INSERT OR IGNORE INTO idea_relations (idea_id, kind, target_type, target_id, note) VALUES (?,?,?,?,?)", [src.id, r.kind, tr.target_type, tr.target_id, typeof r.note === "string" ? r.note : ""]);
+    if (res.changes > 0) {
+      addedRelations.push({ idea: src.canonical_key, kind: r.kind, target: (tr.target_type === "idea" ? "idea:" : "condition:") + tr.target_key });
+    }
+  }
+  let removedRelations = 0;
+  for (const r of opts.remove_relations ?? []) {
+    const src = resolveIdea(db, r.idea);
+    if (!src) {
+      errors.push(`relation source idea not found: ${r.idea}`);
+      continue;
+    }
+    if (!RELATION_KINDS.includes(r.kind)) {
+      errors.push(`invalid relation kind '${r.kind}' (expected one of: ${RELATION_KINDS.join(", ")})`);
+      continue;
+    }
+    const tr = resolveTarget(db, r.target, false);
+    if (!tr) {
+      errors.push(`relation target not found: ${r.target}`);
+      continue;
+    }
+    const del = db.run("DELETE FROM idea_relations WHERE idea_id=? AND kind=? AND target_type=? AND target_id=?", [src.id, r.kind, tr.target_type, tr.target_id]);
+    removedRelations += del.changes;
+  }
+  const finalRow = db.query("SELECT * FROM ideas WHERE id=?").get(ideaId);
+  const d = derivedStateFor(db, ideaId);
+  return {
+    ok: true,
+    idea: {
+      id: finalRow.id,
+      key: finalRow.canonical_key,
+      title: finalRow.title,
+      summary: finalRow.summary,
+      status: finalRow.status,
+      rationale: finalRow.rationale,
+      evidence: finalRow.evidence,
+      created_at: finalRow.created_at,
+      updated_at: finalRow.updated_at,
+      derived: d.derived,
+      blockers: d.blockers
+    },
+    conditions: [...condTouched.values()].slice(0, 20),
+    relations: addedRelations.slice(0, 20),
+    errors,
+    removed_relations: removedRelations
+  };
+}
+var SORT_ORDER = { ready: 0, blocked: 1, testing: 2, validated: 3, disproven: 4, dormant: 5 };
+function projectFrontier(db, opts = {}) {
+  const limit = typeof opts?.limit === "number" && Number.isFinite(opts.limit) ? Math.max(1, Math.min(20, Math.floor(opts.limit))) : 8;
+  const key = normalizeKey(typeof opts?.goal === "string" ? opts.goal : "");
+  if (!key)
+    return { ok: true, goal_key: "", limit, ideas: [], conditions: [], relations: [], counts: { ideas: 0, conditions: 0, relations: 0 } };
+  let candidates = [];
+  if (ideaFtsExists(db)) {
+    candidates = db.query("SELECT i.* FROM idea_fts f JOIN ideas i ON i.rowid=f.rowid WHERE idea_fts MATCH ? ORDER BY rank LIMIT ?").all(ftsQueryV2(key), limit);
+  } else {
+    const like = `%${key}%`;
+    candidates = db.query("SELECT * FROM ideas WHERE canonical_key LIKE ? OR title LIKE ? OR summary LIKE ? OR rationale LIKE ? ORDER BY updated_at DESC LIMIT ?").all(like, like, like, like, limit);
+  }
+  if (candidates.length === 0)
+    return { ok: true, goal_key: key, limit, ideas: [], conditions: [], relations: [], counts: { ideas: 0, conditions: 0, relations: 0 } };
+  const selected = new Map;
+  for (const c of candidates) {
+    if (!selected.has(c.id))
+      selected.set(c.id, c);
+    if (selected.size >= limit)
+      break;
+  }
+  if (selected.size < limit) {
+    outer:
+      for (const c of candidates) {
+        const rels = db.query("SELECT * FROM idea_relations WHERE idea_id=? OR (target_type='idea' AND target_id=?)").all(c.id, c.id);
+        for (const rel of rels) {
+          const nid = rel.target_type === "idea" ? rel.target_id : rel.idea_id;
+          if (!selected.has(nid)) {
+            const nrow = db.query("SELECT * FROM ideas WHERE id=?").get(nid);
+            if (nrow)
+              selected.set(nid, nrow);
+            if (selected.size >= limit)
+              break outer;
+          }
+        }
+      }
+  }
+  const selectedIds = [...selected.keys()];
+  const ideas = selectedIds.map((id) => {
+    const row = selected.get(id);
+    const d = derivedStateFor(db, id);
+    return { id: row.id, key: row.canonical_key, title: row.title, summary: row.summary, status: row.status, derived: d.derived, blockers: d.blockers, updated_at: row.updated_at };
+  });
+  ideas.sort((a, b) => (SORT_ORDER[a.derived] ?? 9) - (SORT_ORDER[b.derived] ?? 9));
+  const boundedIdeas = ideas.slice(0, limit);
+  const condRows = [];
+  if (selectedIds.length > 0) {
+    const marks = selectedIds.map(() => "?").join(",");
+    const rows = db.query(`SELECT DISTINCT c.canonical_key AS ck, c.description AS cd, c.satisfied AS cs, c.satisfied_by AS csb
+       FROM idea_relations r JOIN conditions c ON c.id = r.target_id
+       WHERE r.idea_id IN (${marks}) AND r.kind='requires' AND r.target_type='condition' AND c.satisfied=0
+       ORDER BY c.canonical_key LIMIT 8`).all(...selectedIds);
+    for (const r of rows)
+      condRows.push({ key: r.ck, description: r.cd, satisfied: r.cs === 1, satisfied_by: r.csb });
+  }
+  const relRows = [];
+  if (selectedIds.length > 0) {
+    const marks = selectedIds.map(() => "?").join(",");
+    const rows = db.query(`SELECT DISTINCT r.kind AS rk, r.target_type AS rt, si.canonical_key AS sk, ti.canonical_key AS tik, tc.canonical_key AS tck
+       FROM idea_relations r
+       JOIN ideas si ON si.id = r.idea_id
+       LEFT JOIN ideas ti ON ti.id = r.target_id AND r.target_type='idea'
+       LEFT JOIN conditions tc ON tc.id = r.target_id AND r.target_type='condition'
+       WHERE r.idea_id IN (${marks}) OR (r.target_type='idea' AND r.target_id IN (${marks}))
+       ORDER BY r.id LIMIT 12`).all(...selectedIds, ...selectedIds);
+    for (const r of rows) {
+      const targetKey = r.rt === "idea" ? r.tik : r.tck;
+      relRows.push({ idea: r.sk, kind: r.rk, target: (r.rt === "idea" ? "idea:" : "condition:") + (targetKey ?? "") });
+    }
+  }
+  return {
+    ok: true,
+    goal_key: key,
+    limit,
+    ideas: boundedIdeas,
+    conditions: condRows.slice(0, 8),
+    relations: relRows.slice(0, 12),
+    counts: { ideas: boundedIdeas.length, conditions: condRows.length, relations: relRows.length }
+  };
+}
+
 // project-memory.ts
 var PRIMARY_AGENTS = (process.env.PROJECT_MEMORY_PRIMARY_AGENTS ?? "orchestrator,orchestrator-goal").split(",").map((s) => s.trim()).filter(Boolean);
 var GATE_MODE = process.env.PROJECT_MEMORY_GATE ?? "strict";
@@ -837,6 +1257,7 @@ var project_memory_default = {
       handle = openHandle(path2.join(directory, ".opencode", "memory.sqlite"));
       fts = ftsAvailable(handle.db);
       bootstrap(handle.db, directory, fts);
+      ensureV2Schema(handle.db, fts);
     } catch (e) {
       console.error("[project-memory] init failed:", e);
       handle = null;
@@ -926,6 +1347,64 @@ var project_memory_default = {
               return JSON.stringify({ ok: true, ...res });
             } catch (e) {
               return JSON.stringify({ ok: false, error: `failure append failed: ${e?.message ?? e}` });
+            }
+          }
+        }),
+        project_idea_record: tool({
+          description: "Create or update an idea, condition or relation in project idea memory. Primary agents only. Ideas are hypotheses, separate from established facts (work_items). Lifecycle statuses: proposed, testing, validated, disproven, dormant. BLOCKED/READY are DERIVED from requires-relations and unsatisfied conditions, never persisted. Relations kinds: requires, enables, supports, contradicts, combines_with, derived_from. Target references use 'idea:KEY' or 'condition:KEY' (prefix auto-creates missing targets). 'satisfies' marks conditions satisfied (e.g. when an idea/test is validated). Subagents cannot mutate idea memory \u2014 they report hypotheses to the orchestrator.",
+          args: {
+            idea: tool.schema.object({
+              key: tool.schema.string().optional(),
+              id: tool.schema.string().optional(),
+              title: tool.schema.string().optional(),
+              summary: tool.schema.string().optional(),
+              status: tool.schema.enum(["proposed", "testing", "validated", "disproven", "dormant"]).optional(),
+              rationale: tool.schema.string().optional(),
+              evidence: tool.schema.string().optional()
+            }).optional(),
+            conditions: tool.schema.array(tool.schema.object({
+              key: tool.schema.string(),
+              description: tool.schema.string().optional(),
+              satisfied: tool.schema.boolean().optional(),
+              satisfied_by: tool.schema.string().optional()
+            })).optional(),
+            relations: tool.schema.array(tool.schema.object({
+              idea: tool.schema.string(),
+              kind: tool.schema.enum(RELATION_KINDS),
+              target: tool.schema.string()
+            })).optional(),
+            satisfies: tool.schema.array(tool.schema.string()).optional(),
+            remove_relations: tool.schema.array(tool.schema.object({
+              idea: tool.schema.string(),
+              kind: tool.schema.enum(RELATION_KINDS),
+              target: tool.schema.string()
+            })).optional()
+          },
+          execute: async (args, tctx) => {
+            if (!handle)
+              return JSON.stringify({ ok: false, error: "project memory unavailable" });
+            if (!isPrimary(tctx.agent ?? ""))
+              return JSON.stringify({ ok: false, error: "only primary agents can mutate idea memory (subagents report hypotheses to the orchestrator)" });
+            try {
+              return JSON.stringify(ideaRecord(handle.db, args));
+            } catch (e) {
+              return JSON.stringify({ ok: false, error: `idea_record failed: ${e?.message ?? e}` });
+            }
+          }
+        }),
+        project_frontier: tool({
+          description: "Recall a small bounded set of relevant ideas for a goal: actionable/blocked/testing/validated/disproven ideas, open conditions and useful relations. Read-only; usable by any agent. Derived state: an idea is 'ready' when it has no unsatisfied required condition and no non-validated/disproven required idea; 'blocked' otherwise. Disproven ideas are remembered but never actionable.",
+          args: {
+            goal: tool.schema.string().describe("Goal/topic to search for in idea memory"),
+            limit: tool.schema.number().int().min(1).max(20).optional().describe("Max ideas to return (default 8)")
+          },
+          execute: async (args, tctx) => {
+            if (!handle)
+              return JSON.stringify({ ok: false, error: "project memory unavailable" });
+            try {
+              return JSON.stringify(projectFrontier(handle.db, args));
+            } catch (e) {
+              return JSON.stringify({ ok: false, error: `frontier failed: ${e?.message ?? e}` });
             }
           }
         })

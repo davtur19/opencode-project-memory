@@ -34,6 +34,22 @@ The plugin provides these tools:
 - `project_failure_append`: Append a failure to the failures file.
 - `project_record`: Record the result of a delegated work item.
 
+## Idea memory (V2)
+
+Project-Memory V2 adds a separate idea frontier, orthogonal to the V1 work-item facts:
+
+- `project_frontier(goal, limit?)`: recall a small bounded set of relevant actionable/blocked/testing/validated/disproven ideas, open conditions and useful relations (read-only; usable by any agent).
+- `project_idea_record(...)`: create/update ideas, conditions and relations (primary agents only).
+
+Concepts:
+
+- Ideas are hypotheses separate from established facts; conditions are prerequisites.
+- Relation kinds: `requires`, `enables`, `supports`, `contradicts`, `combines_with`, `derived_from`.
+- Idea lifecycle: `proposed`, `testing`, `validated`, `disproven`, `dormant`.
+- BLOCKED/READY are DERIVED from `requires`-relations (never persisted); BLOCKED is not the same as DISPROVEN.
+
+Migration: V2 is additive — new tables `ideas`, `conditions`, `idea_relations`, optional `idea_fts`; existing V1 databases are upgraded automatically on open; no destructive changes.
+
 ## Fail-closed behavior
 
 - A successful query with no match returns NEW.
@@ -78,6 +94,9 @@ bun test/failclosed.ts
 bun test/test-reclaim.ts
 bun test/reclaim-race.ts
 bun test/claim-race.ts <db> <key> <who>
+bun test/test-v2.ts
+bun test/test-v2-e2e.ts
+bun test/test-v2-plugin.ts
 ```
 
 The file `test/claim-race.ts` requires three arguments. Exactly one contender must win the race.

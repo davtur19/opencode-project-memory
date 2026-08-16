@@ -2,6 +2,7 @@
 import { tool } from "@opencode-ai/plugin"
 import * as path from "node:path"
 import * as PM from "./lib/project-memory-lib"
+import * as PM2 from "./lib/project-memory-v2"
 
 const PRIMARY_AGENTS = (process.env.PROJECT_MEMORY_PRIMARY_AGENTS ?? "orchestrator,orchestrator-goal").split(",").map((s) => s.trim()).filter(Boolean)
 const GATE_MODE = (process.env.PROJECT_MEMORY_GATE ?? "strict") as "strict" | "warn" | "off"
@@ -17,6 +18,7 @@ export default {
       handle = PM.openHandle(path.join(directory, ".opencode", "memory.sqlite"))
       fts = PM.ftsAvailable(handle.db)
       PM.bootstrap(handle.db, directory, fts)
+      PM2.ensureV2Schema(handle.db, fts)
     } catch (e) {
       console.error("[project-memory] init failed:", e)
       handle = null
@@ -96,6 +98,61 @@ export default {
               return JSON.stringify({ ok: true, ...res })
             } catch (e: any) {
               return JSON.stringify({ ok: false, error: `failure append failed: ${e?.message ?? e}` })
+            }
+          },
+        }),
+        project_idea_record: tool({
+          description: "Create or update an idea, condition or relation in project idea memory. Primary agents only. Ideas are hypotheses, separate from established facts (work_items). Lifecycle statuses: proposed, testing, validated, disproven, dormant. BLOCKED/READY are DERIVED from requires-relations and unsatisfied conditions, never persisted. Relations kinds: requires, enables, supports, contradicts, combines_with, derived_from. Target references use 'idea:KEY' or 'condition:KEY' (prefix auto-creates missing targets). 'satisfies' marks conditions satisfied (e.g. when an idea/test is validated). Subagents cannot mutate idea memory — they report hypotheses to the orchestrator.",
+          args: {
+            idea: tool.schema.object({
+              key: tool.schema.string().optional(),
+              id: tool.schema.string().optional(),
+              title: tool.schema.string().optional(),
+              summary: tool.schema.string().optional(),
+              status: tool.schema.enum(["proposed", "testing", "validated", "disproven", "dormant"]).optional(),
+              rationale: tool.schema.string().optional(),
+              evidence: tool.schema.string().optional(),
+            }).optional(),
+            conditions: tool.schema.array(tool.schema.object({
+              key: tool.schema.string(),
+              description: tool.schema.string().optional(),
+              satisfied: tool.schema.boolean().optional(),
+              satisfied_by: tool.schema.string().optional(),
+            })).optional(),
+            relations: tool.schema.array(tool.schema.object({
+              idea: tool.schema.string(),
+              kind: tool.schema.enum(PM2.RELATION_KINDS as unknown as [string, ...string[]]),
+              target: tool.schema.string(),
+            })).optional(),
+            satisfies: tool.schema.array(tool.schema.string()).optional(),
+            remove_relations: tool.schema.array(tool.schema.object({
+              idea: tool.schema.string(),
+              kind: tool.schema.enum(PM2.RELATION_KINDS as unknown as [string, ...string[]]),
+              target: tool.schema.string(),
+            })).optional(),
+          },
+          execute: async (args: any, tctx: any) => {
+            if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
+            if (!isPrimary(tctx.agent ?? "")) return JSON.stringify({ ok: false, error: "only primary agents can mutate idea memory (subagents report hypotheses to the orchestrator)" })
+            try {
+              return JSON.stringify(PM2.ideaRecord(handle.db, args))
+            } catch (e: any) {
+              return JSON.stringify({ ok: false, error: `idea_record failed: ${e?.message ?? e}` })
+            }
+          },
+        }),
+        project_frontier: tool({
+          description: "Recall a small bounded set of relevant ideas for a goal: actionable/blocked/testing/validated/disproven ideas, open conditions and useful relations. Read-only; usable by any agent. Derived state: an idea is 'ready' when it has no unsatisfied required condition and no non-validated/disproven required idea; 'blocked' otherwise. Disproven ideas are remembered but never actionable.",
+          args: {
+            goal: tool.schema.string().describe("Goal/topic to search for in idea memory"),
+            limit: tool.schema.number().int().min(1).max(20).optional().describe("Max ideas to return (default 8)"),
+          },
+          execute: async (args: any, tctx: any) => {
+            if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
+            try {
+              return JSON.stringify(PM2.projectFrontier(handle.db, args))
+            } catch (e: any) {
+              return JSON.stringify({ ok: false, error: `frontier failed: ${e?.message ?? e}` })
             }
           },
         }),
