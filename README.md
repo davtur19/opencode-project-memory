@@ -11,8 +11,8 @@ The plugin persists and retrieves state. The LLM generates, combines and chooses
 
 ## Tools
 
-- `project_work_check`: Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, or already in progress.
-- `project_work_save`: Save durable results, evidence and reusable facts learned from work.
+- `project_work_check`: Check project memory before starting investigative work. Returns prior context and whether the work is new, partial, covered, already in progress, or a memory error. Pass `reclaim_ticket` + `reclaim_owner` to take over an orphaned IN_PROGRESS claim.
+- `project_work_save`: Save durable results and evidence learned from work.
 - `project_failure_save`: Save a reusable failure or blocker when it can prevent repeated wasted work.
 - `project_idea_search`: Search durable project ideas, prerequisites and relations relevant to exploratory work.
 - `project_idea_save`: Save or update a durable idea, prerequisite and its relations.
@@ -21,10 +21,10 @@ There are no hooks, no event listeners, and no gating of other tool calls.
 
 ## Work loop (V1)
 
-1. Before investigative work, call `project_work_check(work=...)`.
-2. Do not repeat COVERED or IN_PROGRESS work. For PARTIAL work, do only the unresolved delta.
+1. Before investigative work, call `project_work_check(work=...)`. A claim (default `claim: true`) atomically reserves NEW/PARTIAL work; pass `claim: false` to only query.
+2. The result carries `status`, `ticket`, `established`, `do_not_repeat`, `unresolved`, `evidence`, `read_first`, `scratch`, and `candidates`. Do not repeat COVERED or IN_PROGRESS work. For PARTIAL work, do only the unresolved delta.
 3. Save the result with `project_work_save(ticket=..., status=..., summary=..., evidence=...)`.
-4. If `project_work_check` returns IN_PROGRESS, never retry `task()` for that work. Steer the existing worker via its `task_id` when possible; reclaim only if orphaned; otherwise continue other work.
+4. If `project_work_check` returns IN_PROGRESS, never retry `task()` for that work. Steer the existing worker via its `task_id` when possible; reclaim only if orphaned — with `reclaim_ticket` plus the `owner_session` observed in the IN_PROGRESS result (compare-and-swap on the current owner); otherwise continue other work.
 
 ## Idea loop (V2)
 
@@ -41,28 +41,30 @@ There are no hooks, no event listeners, and no gating of other tool calls.
 
 ## Permissions
 
-- `orchestrator` / `orchestrator-goal`: idea search and idea save allowed.
-- `subagent`: idea search and idea save denied; failure save allowed.
-- `verifier` / `vision`: project-memory mutation denied.
+Primary agents are configured with `PROJECT_MEMORY_PRIMARY_AGENTS` (default `orchestrator,orchestrator-goal`).
+
+- **Primary agents**: full access — claim and reclaim work, record results, append failures, read and write idea memory.
+- **`subagent`**: may query `project_work_check` with `claim: false` and append failures. Idea memory (search and save) and result recording are denied — report hypotheses to the orchestrator.
+- **Any other agent** (e.g. `verifier`, `vision`): read-only queries allowed; all mutations denied.
 
 ## Fail-closed behavior
 
 - A successful query with no match returns NEW.
-- A memory error returns MEMORY_ERROR (`memoryUnavailable: true`) so the caller can handle it explicitly.
-- The tools `vision` and `verifier` are exempt.
+- A memory error returns `MEMORY_ERROR` with an error cause, so the caller can handle it explicitly. The plugin never returns a result from an uncertain connection state: it retries, then reopens the database, then fails closed.
+- `project_work_check` and `project_failure_save` run through the same recovery path, so a corrupt or unavailable database surfaces as a memory error rather than a crash.
 
 ## Requirements
 
 - OpenCode with plugin/custom-tool API support.
 - Bun runtime.
-- SQLite with FTS5 support.
+- SQLite. FTS5 is optional — when unavailable, retrieval falls back to LIKE matching.
 
 Compatibility is claimed only for the OpenCode versions this plugin was tested with.
 
 ## Files
 
 - `project-memory.ts`: The plugin entry point.
-- `lib/project-memory-lib.ts`: The core logic. It contains the schema, the FTS5 search with LIKE fallback, the atomic claim, the preflight, the bootstrap, and the fail-closed recovery.
+- `lib/project-memory-lib.ts`: The core logic. It contains the schema, the FTS5 search with LIKE fallback, the atomic claim, the compare-and-swap reclaim, the preflight, the failure memory, the Markdown index for `read_first`, and the fail-closed recovery.
 - `lib/project-memory-v2.ts`: The V2 idea memory core.
 - `test/`: The standalone tests for Bun.
 
