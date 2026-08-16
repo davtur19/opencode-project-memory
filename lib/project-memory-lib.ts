@@ -183,11 +183,12 @@ function ftsQuery(key: string): string {
 
 export function maybeSyncFts(db: Database, fts: boolean) {
   if (!fts) return
-  const maxUpd = (db.query("SELECT COALESCE(MAX(updated_at),'') AS m FROM work_items").get() as { m: string }).m
+  const st = db.query("SELECT COUNT(*) AS n, COALESCE(MAX(updated_at),'') AS m FROM work_items").get() as { n: number; m: string }
   const last = (db.query("SELECT value FROM meta WHERE key='last_fts_sync'").get() as { value: string } | undefined)?.value ?? ""
-  if (maxUpd !== last) {
+  const [lastN, lastM] = last.split("|")
+  if (st.n !== Number(lastN) || st.m !== lastM) {
     syncAllFts(db, fts)
-    db.run("INSERT INTO meta (key, value) VALUES ('last_fts_sync', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [maxUpd])
+    db.run("INSERT INTO meta (key, value) VALUES ('last_fts_sync', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [`${st.n}|${st.m}`])
   }
 }
 
@@ -321,15 +322,29 @@ export function appendFailure(db: Database, opts: { projectDir: string; symptom:
   return { id, path: file }
 }
 
-// ---------- goal checkpoint (atomic single-writer) ----------
+// ---------- goal checkpoint (atomic single-writer, managed section) ----------
+const GOAL_START = "<!-- PROJECT-MEMORY:CURRENT-START -->"
+const GOAL_END = "<!-- PROJECT-MEMORY:CURRENT-END -->"
+
 export function checkpointGoal(projectDir: string, content: string): { path: string; bytes: number } {
   const dir = path.join(projectDir, ".opencode")
   fs.mkdirSync(dir, { recursive: true })
   const file = path.join(dir, "goal-state.md")
+  let existing = ""
+  if (fs.existsSync(file)) existing = fs.readFileSync(file, "utf8")
+  const s = existing.indexOf(GOAL_START)
+  const e = existing.indexOf(GOAL_END)
+  let next: string
+  if (s === -1 || e === -1 || e < s) {
+    const sep = existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""
+    next = existing + sep + GOAL_START + "\n" + content + "\n" + GOAL_END + "\n"
+  } else {
+    next = existing.slice(0, s + GOAL_START.length) + "\n" + content + "\n" + existing.slice(e)
+  }
   const tmp = path.join(dir, `.goal-state.md.tmp-${process.pid}`)
-  fs.writeFileSync(tmp, content, "utf8")
+  fs.writeFileSync(tmp, next, "utf8")
   fs.renameSync(tmp, file)
-  return { path: file, bytes: Buffer.byteLength(content) }
+  return { path: file, bytes: Buffer.byteLength(next) }
 }
 
 // ---------- bootstrap (non-destructive importer) ----------

@@ -67,7 +67,7 @@ export default {
           },
         }),
         project_goal_checkpoint: tool({
-          description: "Write the project goal-state.md atomically (single logical writer: the orchestrator). Primary agents only. Content is the full markdown of goal-state.md.",
+          description: "Write the current checkpoint section of the project goal-state.md (single logical writer: the orchestrator). Primary agents only. Content is the current checkpoint section; historical content outside the managed markers is preserved byte-for-byte.",
           args: { content: tool.schema.string() },
           execute: async (args: any, tctx: any) => {
             if (!isPrimary(tctx.agent ?? "")) return JSON.stringify({ ok: false, error: "only primary agents can checkpoint goal-state" })

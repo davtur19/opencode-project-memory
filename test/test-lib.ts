@@ -89,5 +89,38 @@ await Promise.all(Array.from({ length: 20 }, async (_, i) => {
 }))
 check("concurrent failure ids unique", new Set(ids12).size === ids12.length, ids12.join(" "))
 
+// 13. FTS sync staleness race: same-ms insert after a sync is missed by max-updated_at-only tracking
+const dir13 = fs.mkdtempSync(path.join(os.tmpdir(), "pm-fts-"))
+const db13 = PM.openMemory(path.join(dir13, "memory.sqlite"))
+const fts13 = PM.ftsAvailable(db13)
+PM.claimWorkItem(db13, { canonicalKey: "widget alpha", ownerSession: "ses_A" })
+PM.syncAllFts(db13, fts13)
+const maxUpd13 = (db13.query("SELECT MAX(updated_at) AS m FROM work_items").get() as { m: string }).m
+db13.run("INSERT INTO meta (key, value) VALUES ('last_fts_sync', ?)", [maxUpd13])
+db13.run("INSERT INTO work_items (id, canonical_key, status, summary, unresolved, notes, owner_session, parent_key, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", ["idB13", "widget beta", "in_progress", "beta item", "", "", "ses_A", null, "agent", maxUpd13, maxUpd13])
+PM.maybeSyncFts(db13, fts13)
+const n13 = (db13.query("SELECT COUNT(*) AS n FROM memory_fts WHERE canonical_key='widget beta'").get() as { n: number }).n
+check("fts staleness race: same-ms insert synced", n13 === 1, `count=${n13}`)
+
+// 14-17. goal checkpoint managed section (G1 history preserve, G2 replace, G3 tiny, G5 no tmp files)
+const GS = "<!-- PROJECT-MEMORY:CURRENT-START -->"
+const GE = "<!-- PROJECT-MEMORY:CURRENT-END -->"
+const dirG = fs.mkdtempSync(path.join(os.tmpdir(), "pm-goal-"))
+const gdir = path.join(dirG, ".opencode")
+fs.mkdirSync(gdir, { recursive: true })
+const hist = Array.from({ length: 200 }, (_, i) => `historical line ${i}`).join("\n")
+fs.writeFileSync(path.join(gdir, "goal-state.md"), hist, "utf8")
+PM.checkpointGoal(dirG, "checkpoint v1")
+let g1 = fs.readFileSync(path.join(gdir, "goal-state.md"), "utf8")
+check("G1 history preserved + section appended", g1.startsWith(hist) && g1.includes(GS) && g1.includes(GE) && g1.includes("checkpoint v1"))
+PM.checkpointGoal(dirG, "checkpoint v2")
+g1 = fs.readFileSync(path.join(gdir, "goal-state.md"), "utf8")
+check("G2 section replaced in place", g1.startsWith(hist) && g1.includes("checkpoint v2") && !g1.includes("checkpoint v1"))
+PM.checkpointGoal(dirG, "x")
+g1 = fs.readFileSync(path.join(gdir, "goal-state.md"), "utf8")
+check("G3 tiny checkpoint keeps history", g1.startsWith(hist) && g1.includes(GS + "\nx\n" + GE))
+const tmpLeft = fs.readdirSync(gdir).filter((f) => f.startsWith(".goal-state.md.tmp-")).length
+check("G5 no tmp files left behind", tmpLeft === 0, `left=${tmpLeft}`)
+
 console.log(`\nRESULT: ${pass} pass, ${fail} fail`)
 process.exit(fail ? 1 : 0)
