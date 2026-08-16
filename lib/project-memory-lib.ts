@@ -186,6 +186,43 @@ function ftsQuery(key: string): string {
   return toks.map((t) => `"${t}"`).join(" OR ")
 }
 
+// ---------- semantic continuation gate ----------
+// An active (in_progress) ticket found only via the loose FTS candidate list
+// may be reused ONLY when there is a real task correspondence: at least
+// MIN_SEMANTIC_OVERLAP significant shared tokens between the request key and
+// the candidate's stored text. FTS candidate membership alone (any single
+// shared token, e.g. "local") must never be enough — regression: an unrelated
+// active ticket was repeatedly returned for a different task.
+const MIN_SEMANTIC_OVERLAP = 2
+const STOPWORDS = new Set([
+  "a","an","and","are","as","at","be","been","by","for","from","in","into","is","it",
+  "of","on","or","that","the","to","was","were","will","with","do","does","did","have",
+  "has","had","not","but","this","these","those","its","our","your","their","we","you",
+  "they","he","she","i","me","my","him","her","us","them","then","than","so","if",
+  "while","when","where","which","who","whom","what","why","how","all","any","both",
+  "each","few","more","most","other","some","such","no","nor","only","own","same",
+  "too","very","just","also","even",
+  "di","da","e","a","il","la","le","i","gli","lo","un","una","uno","del","della","dei",
+  "delle","nel","nella","nei","nelle","con","su","per","che","chi","cui","piu","meno",
+  "non","si","se","quando","dove","come","cosa","questo","questa","questi","queste",
+  "quello","quella","quelli","quelle",
+])
+function sigTokens(s: string): Set<string> {
+  const out = new Set<string>()
+  for (const t of normalizeKey(s).split(" ").filter(Boolean)) {
+    if (t.length >= 3 && !STOPWORDS.has(t)) out.add(t)
+  }
+  return out
+}
+function tokenOverlap(a: string, b: string): number {
+  const sa = sigTokens(a)
+  const sb = sigTokens(b)
+  let n = 0
+  for (const t of sa) if (sb.has(t)) n++
+  return n
+}
+
+
 export function maybeSyncFts(db: Database, fts: boolean) {
   if (!fts) return
   const st = db.query("SELECT COUNT(*) AS n, COALESCE(MAX(updated_at),'') AS m FROM work_items").get() as { n: number; m: string }
@@ -203,6 +240,11 @@ export type PreflightResult = {
   status: PreflightStatus
   ticket?: string
   canonical_key: string
+  requested_key?: string
+  matched_key?: string
+  match_reason?: string
+  match_score?: number
+  reuse_denied?: { id: string; key: string; overlap: number }[]
   summary?: string
   established: string[]
   do_not_repeat: string[]
@@ -218,20 +260,26 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
   const key = normalizeKey(opts.task)
   maybeSyncFts(db, opts.fts)
   const fts = opts.fts
+  let matchSrc: "exact" | "alias" | "fail-id" | null = null
   let item = db.query("SELECT * FROM work_items WHERE canonical_key=?").get(key) as WorkItem | undefined
+  if (item) matchSrc = "exact"
   if (!item) {
     item = db.query("SELECT w.* FROM aliases a JOIN work_items w ON w.id=a.work_item_id WHERE a.alias=? OR a.alias=?").get(key, opts.task.trim().toLowerCase()) as WorkItem | undefined
+    if (item) matchSrc = "alias"
   }
   if (!item) {
     const idMatch = opts.task.match(/FAIL-\d+/i)
-    if (idMatch) item = db.query("SELECT * FROM work_items WHERE canonical_key=?").get(normalizeKey(idMatch[0])) as WorkItem | undefined
+    if (idMatch) {
+      item = db.query("SELECT * FROM work_items WHERE canonical_key=?").get(normalizeKey(idMatch[0])) as WorkItem | undefined
+      if (item) matchSrc = "fail-id"
+    }
   }
-  let candidates: WorkItem[] = []
+  let candidates: (WorkItem & { fts_rank?: number })[] = []
   if (fts) {
-    candidates = db.query("SELECT w.* FROM memory_fts f JOIN work_items w ON w.rowid=f.rowid WHERE memory_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)) as WorkItem[]
+    candidates = db.query("SELECT w.*, f.rank AS fts_rank FROM memory_fts f JOIN work_items w ON w.rowid=f.rowid WHERE memory_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)) as (WorkItem & { fts_rank?: number })[]
   } else {
     const like = `%${key}%`
-    candidates = db.query("SELECT * FROM work_items WHERE canonical_key LIKE ? OR summary LIKE ? OR unresolved LIKE ? LIMIT 6").all(like, like, like) as WorkItem[]
+    candidates = db.query("SELECT * FROM work_items WHERE canonical_key LIKE ? OR summary LIKE ? OR unresolved LIKE ? LIMIT 6").all(like, like, like) as (WorkItem & { fts_rank?: number })[]
   }
   let readFirst: string[] = []
   if (fts) {
@@ -244,26 +292,35 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
 
   if (item) {
     if (item.status === "in_progress") {
-      return { status: "IN_PROGRESS", canonical_key: key, ticket: item.id, owner_session: item.owner_session ?? undefined, summary: item.summary, established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, owner_session: item.owner_session ?? undefined, summary: item.summary, established: [], do_not_repeat: [], unresolved: item.unresolved ? [item.unresolved] : [], evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
     }
     if (item.status === "done" || item.status === "covered" || item.status === "blocked") {
       const unresolved = item.unresolved ? [item.unresolved] : []
       if (item.status === "blocked") unresolved.unshift(`BLOCKED: ${item.summary}`)
-      return { status: "COVERED", canonical_key: key, ticket: item.id, summary: item.summary, established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${item.canonical_key} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
+      return { status: "COVERED", canonical_key: key, requested_key: key, matched_key: item.canonical_key, match_reason: matchSrc ?? "exact", ticket: item.id, summary: item.summary, established: [item.summary].filter(Boolean), do_not_repeat: [`Covered by ${item.canonical_key} (${item.id})`], unresolved, evidence: cap(evidenceFor(db, item.id), 10), read_first: readFirst, candidates: [] }
     }
     // status 'new' → claimable
     if (opts.claim) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" })
-      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] } }
-      return { status: "IN_PROGRESS", canonical_key: key, ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [] }
+      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] } }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [] }
     }
-    return { status: "NEW", canonical_key: key, established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] }
+    return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] }
   }
 
+  // Semantic continuation gate: reuse an active ticket ONLY when it really
+  // corresponds to the requested task. FTS candidate membership alone (any
+  // single shared token) is never sufficient.
+  let reuseDenied: { id: string; key: string; overlap: number }[] = []
   const inProgressCandidates = candidates.filter((c) => c.status === "in_progress")
   if (inProgressCandidates.length > 0) {
-    const c = inProgressCandidates[0]
-    return { status: "IN_PROGRESS", canonical_key: key, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [] }
+    const scored = inProgressCandidates.map((c) => ({ c, overlap: tokenOverlap(key, `${c.canonical_key} ${c.summary} ${c.unresolved}`) }))
+    const best = scored.reduce((a, b) => (b.overlap > a.overlap ? b : a))
+    if (best.overlap >= MIN_SEMANTIC_OVERLAP) {
+      const c = best.c
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.canonical_key, match_reason: "semantic-continuation", match_score: c.fts_rank, ticket: c.id, owner_session: c.owner_session ?? undefined, summary: c.summary, established: [], do_not_repeat: [], unresolved: c.unresolved ? [c.unresolved] : [], evidence: cap(evidenceFor(db, c.id), 10), read_first: readFirst, candidates: [] }
+    }
+    reuseDenied = scored.map(({ c, overlap }) => ({ id: c.id, key: c.canonical_key, overlap }))
   }
 
   const doneCandidates = candidates.filter((c) => c.status === "done" || c.status === "covered" || c.status === "blocked")
@@ -274,21 +331,20 @@ export function preflight(db: Database, opts: { task: string; claim: boolean; ow
     const cand = doneCandidates.map((c) => ({ key: c.canonical_key, status: c.status, id: c.id }))
     if (opts.claim) {
       const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, notes: `delta of ${doneCandidates[0].canonical_key}`, ownerSession: opts.ownerSession, parentKey: doneCandidates[0].canonical_key, source: "agent" })
-      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand } }
-      return { status: "IN_PROGRESS", canonical_key: key, ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand }
+      if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "PARTIAL", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "parent", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, scratch: sc, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined } }
+      return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established, do_not_repeat: dnr, unresolved: [], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined }
     }
-    return { status: "PARTIAL", canonical_key: key, established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand }
+    return { status: "PARTIAL", canonical_key: key, requested_key: key, match_reason: "none", established, do_not_repeat: dnr, unresolved: [opts.task], evidence: ev, read_first: readFirst, candidates: cand, reuse_denied: reuseDenied.length ? reuseDenied : undefined }
   }
 
   // NEW
   if (opts.claim) {
     const c = claimWorkItem(db, { canonicalKey: key, summary: opts.task, unresolved: opts.task, ownerSession: opts.ownerSession, source: "agent" })
-    if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [] } }
-    return { status: "IN_PROGRESS", canonical_key: key, ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [] }
+    if (c.ok) { const sc = ensureScratch(scratchBase, c.item.id); return { status: "NEW", ticket: c.item.id, canonical_key: key, requested_key: key, matched_key: c.item.canonical_key, match_reason: "created", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, scratch: sc, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined } }
+    return { status: "IN_PROGRESS", canonical_key: key, requested_key: key, matched_key: c.inProgress.canonical_key, match_reason: "claim-conflict", ticket: c.inProgress.id, owner_session: c.inProgress.owner_session ?? undefined, summary: c.inProgress.summary, established: [], do_not_repeat: [], unresolved: [], evidence: cap(evidenceFor(db, c.inProgress.id), 10), read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined }
   }
-  return { status: "NEW", canonical_key: key, established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [] }
+  return { status: "NEW", canonical_key: key, requested_key: key, match_reason: "none", established: [], do_not_repeat: [], unresolved: [opts.task], evidence: [], read_first: readFirst, candidates: [], reuse_denied: reuseDenied.length ? reuseDenied : undefined }
 }
-
 // ---------- record ----------
 export function recordResult(db: Database, opts: { ticket: string; status: string; summary?: string; unresolved?: string; evidence?: string[]; facts?: { key: string; value: string }[] }): { ok: true; item: WorkItem } | { ok: false; reason: string } {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
