@@ -307,7 +307,7 @@ function preflightCore(db, opts) {
     candidates = db.query("SELECT w.*, f.rank AS fts_rank FROM memory_fts f JOIN work_items w ON w.rowid=f.rowid WHERE memory_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key));
   } else {
     const like = `%${key}%`;
-    candidates = db.query("SELECT * FROM work_items WHERE canonical_key LIKE ? OR summary LIKE ? OR unresolved LIKE ? LIMIT 6").all(like, like, like);
+    candidates = db.query("SELECT * FROM work_items WHERE canonical_key LIKE ? OR summary LIKE ? OR unresolved LIKE ? OR notes LIKE ? LIMIT 6").all(like, like, like, like);
   }
   const readFirst = readFirstFor(db, key, fts);
   const scratchBase = projectScratchBase(opts.projectDir);
@@ -389,12 +389,11 @@ function recordFailure(db, opts) {
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
   const id = `FAIL-${ymd}-${ulid().slice(-8)}`;
   const key = normalizeKey(id);
-  const c = claimWorkItem(db, { canonicalKey: key, summary: opts.lesson, unresolved: "", notes: `symptom: ${opts.symptom}; cause: ${opts.cause}`, ownerSession: "system", source: "agent" });
+  const baseNotes = `symptom: ${opts.symptom}; cause: ${opts.cause}`;
+  const notes = opts.topic ? `${baseNotes}; topic: ${normalizeKey(opts.topic)}` : baseNotes;
+  const c = claimWorkItem(db, { canonicalKey: key, summary: opts.lesson, unresolved: "", notes, ownerSession: "system", source: "agent" });
   const item = c.ok ? c.item : c.inProgress;
-  db.run("UPDATE work_items SET status='done', summary=?, notes=?, updated_at=? WHERE id=?", [opts.lesson, `symptom: ${opts.symptom}; cause: ${opts.cause}`, nowIso(), item.id]);
-  if (opts.topic) {
-    db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [item.id, normalizeKey(opts.topic)]);
-  }
+  db.run("UPDATE work_items SET status='done', summary=?, notes=?, updated_at=? WHERE id=?", [opts.lesson, notes, nowIso(), item.id]);
   return { id };
 }
 function bootstrap(db, projectDir, fts) {

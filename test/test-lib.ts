@@ -46,11 +46,13 @@ check("alias match → IN_PROGRESS", r.status === "IN_PROGRESS", JSON.stringify(
 // 6. failure record (SQLite-only; no FAILURES.md dual-write)
 const f = PM.recordFailure(db, { symptom: "s", cause: "c", lesson: "l", topic: "widget X" })
 check("failure id format", /^FAIL-\d{8}-[A-Z0-9]{8}$/.test(f.id), f.id)
+const fRow = db.query("SELECT * FROM work_items WHERE canonical_key=?").get(PM.normalizeKey(f.id)) as any
 check("failure row stored in SQLite", (db.query("SELECT COUNT(*) AS n FROM work_items WHERE canonical_key=?").get(PM.normalizeKey(f.id)) as { n: number }).n === 1)
 check("failure persisted as done with lesson summary", (db.query("SELECT status, summary FROM work_items WHERE canonical_key=?").get(PM.normalizeKey(f.id)) as any).status === "done")
 check("no FAILURES.md created", !fs.existsSync(path.join(dir, ".opencode", "FAILURES.md")))
 r = PM.preflight(db, { task: "widget X", claim: false, ownerSession: "ses_D", projectDir: dir, fts })
-check("failure topic → COVERED", r.status === "COVERED", JSON.stringify(r))
+check("failure topic NOT SAME WORK (no COVERED)", r.status !== "COVERED", JSON.stringify(r))
+check("failure topic retrievable as related PARTIAL context", r.status === "PARTIAL" && r.candidates.some((c) => c.ticket === fRow.id), JSON.stringify(r))
 r = PM.preflight(db, { task: f.id, claim: false, ownerSession: "ses_D", projectDir: dir, fts })
 check("failure FAIL-ID → COVERED", r.status === "COVERED" && r.established.includes("l"), JSON.stringify(r))
 

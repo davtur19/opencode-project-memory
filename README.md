@@ -6,7 +6,7 @@ The plugin persists and retrieves state. The LLM generates, combines and chooses
 
 ## What it stores
 
-- **V1 — work memory**: work items, findings, evidence and reusable failures. It prevents duplicate investigative work and keeps project state across sessions.
+- **V1 — work memory**: work items, findings, evidence and reusable failures. It helps agents detect and avoid duplicate investigative work and keeps project state across sessions.
 - **V2 — idea memory**: ideas (hypotheses), prerequisites (conditions) and their relations. Ideas are separate from established facts.
 
 Markdown under `.opencode/` is legacy/read-only documentation: it may be indexed for `read_first` context but is never operational state and is never imported back into work items.
@@ -113,6 +113,7 @@ bun test/test-packet-compact.ts
 bun test/test-scheduler-removed.ts
 bun test/test-hardening.ts
 bun test/test-final-hardening.ts
+bun test/test-failure-topic.ts
 ```
 
 The file `test/claim-race.ts` requires three arguments. Exactly one contender must win the race.

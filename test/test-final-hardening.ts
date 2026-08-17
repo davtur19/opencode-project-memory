@@ -197,10 +197,12 @@ const save = (db: PM.DB, ticket: string, status: string, ownerSession: string, e
 {
   const { db, dir, fts } = freshDb("recoverfail")
   const f = PM.recordFailure(db, { symptom: "sy", cause: "ca", lesson: "le", topic: "recoverable topic" })
+  const fRow = db.query("SELECT * FROM work_items WHERE canonical_key=?").get(PM.normalizeKey(f.id)) as any
   const r1 = PM.preflight(db, { task: "recoverable topic", claim: false, ownerSession: "ses_X", projectDir: dir, fts })
-  check("F4 failure recoverable via topic → COVERED", r1.status === "COVERED" && !!r1.ticket, JSON.stringify(r1))
+  check("F4 failure topic NOT SAME WORK (no COVERED)", r1.status !== "COVERED", JSON.stringify(r1))
+  check("F4 failure topic retrievable as related PARTIAL context", r1.status === "PARTIAL" && r1.candidates.some((c) => c.ticket === fRow.id), JSON.stringify(r1))
   const r2 = PM.preflight(db, { task: f.id, claim: false, ownerSession: "ses_X", projectDir: dir, fts })
-  check("F4 failure recoverable via FAIL-ID → COVERED same ticket", r2.status === "COVERED" && r2.ticket === r1.ticket, JSON.stringify(r2))
+  check("F4 failure recoverable via FAIL-ID → COVERED same ticket", r2.status === "COVERED" && r2.ticket === fRow.id, JSON.stringify(r2))
   check("F4 failure lesson surfaced in COVERED", r2.established.includes("le"), JSON.stringify(r2.established))
   check("F4 no FAILURES.md created", !fs.existsSync(path.join(dir, ".opencode", "FAILURES.md")))
 }

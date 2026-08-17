@@ -391,7 +391,10 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
     candidates = db.query("SELECT w.*, f.rank AS fts_rank FROM memory_fts f JOIN work_items w ON w.rowid=f.rowid WHERE memory_fts MATCH ? ORDER BY rank LIMIT 6").all(ftsQuery(key)) as (WorkItem & { fts_rank?: number })[]
   } else {
     const like = `%${key}%`
-    candidates = db.query("SELECT * FROM work_items WHERE canonical_key LIKE ? OR summary LIKE ? OR unresolved LIKE ? LIMIT 6").all(like, like, like) as (WorkItem & { fts_rank?: number })[]
+    // notes is included so failure topics stored as notes context stay
+    // retrievable as related candidates when FTS5 is unavailable. Like FTS, this
+    // only feeds PARTIAL context — never SAME WORK identity.
+    candidates = db.query("SELECT * FROM work_items WHERE canonical_key LIKE ? OR summary LIKE ? OR unresolved LIKE ? OR notes LIKE ? LIMIT 6").all(like, like, like, like) as (WorkItem & { fts_rank?: number })[]
   }
   const readFirst = readFirstFor(db, key, fts)
   const scratchBase = projectScratchBase(opts.projectDir)
@@ -492,18 +495,23 @@ export function recordResult(db: Database, opts: { ticket: string; status: strin
 // is performed — historical Markdown files are never created or modified here
 // (bootstrap() may still index an existing one for read_first as legacy
 // documentation only). No fake file evidence is created for a file that is no
-// longer written; the topic alias stays for retrieval.
+// longer written.
+// topic is retrieval context ONLY, never work identity: it is stored in the
+// failure's notes (an FTS-indexed searchable field) and NOT in the aliases table.
+// The aliases table drives SAME WORK identity in preflight — inserting a generic
+// topic there would let a later work_check exact-match this done failure via
+// alias and wrongly report COVERED. Topic stays findable as related PARTIAL
+// context through FTS (and the LIKE fallback, which searches notes).
 export function recordFailure(db: Database, opts: { symptom: string; cause: string; lesson: string; topic?: string }): { id: string } {
   const d = new Date()
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`
   const id = `FAIL-${ymd}-${ulid().slice(-8)}`
   const key = normalizeKey(id)
-  const c = claimWorkItem(db, { canonicalKey: key, summary: opts.lesson, unresolved: "", notes: `symptom: ${opts.symptom}; cause: ${opts.cause}`, ownerSession: "system", source: "agent" })
+  const baseNotes = `symptom: ${opts.symptom}; cause: ${opts.cause}`
+  const notes = opts.topic ? `${baseNotes}; topic: ${normalizeKey(opts.topic)}` : baseNotes
+  const c = claimWorkItem(db, { canonicalKey: key, summary: opts.lesson, unresolved: "", notes, ownerSession: "system", source: "agent" })
   const item = c.ok ? c.item : c.inProgress
-  db.run("UPDATE work_items SET status='done', summary=?, notes=?, updated_at=? WHERE id=?", [opts.lesson, `symptom: ${opts.symptom}; cause: ${opts.cause}`, nowIso(), item.id])
-  if (opts.topic) {
-    db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [item.id, normalizeKey(opts.topic)])
-  }
+  db.run("UPDATE work_items SET status='done', summary=?, notes=?, updated_at=? WHERE id=?", [opts.lesson, notes, nowIso(), item.id])
   return { id }
 }
 
