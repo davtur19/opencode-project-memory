@@ -61,7 +61,7 @@ Primary agents are configured with `PROJECT_MEMORY_PRIMARY_AGENTS` (default `orc
 
 ## Requirements
 
-- OpenCode with plugin/custom-tool API support.
+- OpenCode with plugin/custom-tool API support. The [davtur19 fork](https://github.com/davtur19/opencode) is recommended.
 - Background subagents enabled (`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true`) — strongly recommended: it lets the orchestrator delegate independent investigative work to background agents (`task(background=true)`) and keep going, which is what the claim-based duplicate-work coordination is designed for.
 - Bun runtime.
 - SQLite. FTS5 is optional — when unavailable, retrieval falls back to LIKE matching.
