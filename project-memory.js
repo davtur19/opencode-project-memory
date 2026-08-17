@@ -9,7 +9,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 function canAppendFailure(agent, primaryAgents) {
-  return primaryAgents.includes(agent);
+  return primaryAgents.includes(agent) || agent === "subagent";
 }
 var CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 function ulid(now = Date.now()) {
@@ -371,8 +371,8 @@ function recordResult(db, opts) {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket);
   if (!item)
     return { ok: false, reason: `ticket not found: ${opts.ticket}` };
-  if (item.status === "in_progress" && item.owner_session && item.owner_session !== opts.ownerSession) {
-    return { ok: false, reason: `ticket ${opts.ticket} is in_progress and owned by ${item.owner_session}; session ${opts.ownerSession ?? "unknown"} cannot record it (reclaim via project_work_check with reclaim_ticket=${opts.ticket} and reclaim_owner=${item.owner_session})` };
+  if (item.owner_session && item.owner_session !== opts.ownerSession) {
+    return { ok: false, reason: `ticket ${opts.ticket} is owned by ${item.owner_session} (status=${item.status}); session ${opts.ownerSession ?? "unknown"} cannot record it (reclaim via project_work_check with reclaim_ticket=${opts.ticket} and reclaim_owner=${item.owner_session})` };
   }
   const now = nowIso();
   const status = ["done", "blocked", "failed"].includes(opts.status) ? opts.status : "done";
@@ -384,29 +384,18 @@ function recordResult(db, opts) {
   }
   return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) };
 }
-function appendFailure(db, opts) {
+function recordFailure(db, opts) {
   const d = new Date;
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
   const id = `FAIL-${ymd}-${ulid().slice(-8)}`;
-  const dir = path.join(opts.projectDir, ".opencode");
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, "FAILURES.md");
-  const block = `
-## ${id} \u2014 ${new Date().toISOString()}
-- **Sintomo**: ${opts.symptom}
-- **Causa**: ${opts.cause}
-- **Lezione**: ${opts.lesson}
-`;
-  fs.appendFileSync(file, block, "utf8");
   const key = normalizeKey(id);
   const c = claimWorkItem(db, { canonicalKey: key, summary: opts.lesson, unresolved: "", notes: `symptom: ${opts.symptom}; cause: ${opts.cause}`, ownerSession: "system", source: "agent" });
   const item = c.ok ? c.item : c.inProgress;
   db.run("UPDATE work_items SET status='done', summary=?, notes=?, updated_at=? WHERE id=?", [opts.lesson, `symptom: ${opts.symptom}; cause: ${opts.cause}`, nowIso(), item.id]);
-  db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [item.id, file, "failures", id]);
   if (opts.topic) {
     db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [item.id, normalizeKey(opts.topic)]);
   }
-  return { id, path: file };
+  return { id };
 }
 function bootstrap(db, projectDir, fts) {
   if (!fts)
@@ -725,7 +714,7 @@ function ideaRecord(db, opts = {}) {
       continue;
     }
     const cond = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(skey);
-    if (!cond) {
+    if (!cond && !condIds.has(skey)) {
       errors.push(`satisfies target condition not found: ${skey}`);
       continue;
     }
@@ -1056,7 +1045,7 @@ var project_memory_default = {
           }
         }),
         project_failure_save: tool({
-          description: "Save a stable or reproducible failure only when it has an actionable lesson likely to prevent meaningful repeated work. Ordinary failed attempts belong in the work result.",
+          description: "Save a stable or reproducible failure only when it has an actionable lesson likely to prevent repeated meaningful work. Ordinary failed attempts belong in the work result. Persisted in SQLite (canonical operational memory); available to primary agents and subagent.",
           args: {
             symptom: tool.schema.string().describe("What failed"),
             cause: tool.schema.string().describe("Known cause, or unknown"),
@@ -1067,13 +1056,13 @@ var project_memory_default = {
             if (!handle)
               return JSON.stringify({ ok: false, error: "project memory unavailable" });
             if (!canAppendFailure(tctx.agent ?? "", PRIMARY_AGENTS))
-              return JSON.stringify({ ok: false, error: "agent is not allowed to append project failures" });
+              return JSON.stringify({ ok: false, error: "agent is not allowed to record project failures" });
             try {
-              const res = appendFailure(handle.db, { projectDir: directory, ...args, fts });
+              const res = recordFailure(handle.db, args);
               syncAllFts(handle.db, fts);
               return JSON.stringify({ ok: true, ...res });
             } catch (e) {
-              return JSON.stringify({ ok: false, error: `failure append failed: ${e?.message ?? e}` });
+              return JSON.stringify({ ok: false, error: `failure record failed: ${e?.message ?? e}` });
             }
           }
         }),

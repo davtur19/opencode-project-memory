@@ -43,12 +43,16 @@ db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?)", [y.id, "wy"])
 r = PM.preflight(db, { task: "wy", claim: false, ownerSession: "ses_A", projectDir: dir, fts })
 check("alias match → IN_PROGRESS", r.status === "IN_PROGRESS", JSON.stringify(r))
 
-// 6. failure append
-const f = PM.appendFailure(db, { projectDir: dir, symptom: "s", cause: "c", lesson: "l", topic: "widget X", fts })
+// 6. failure record (SQLite-only; no FAILURES.md dual-write)
+const f = PM.recordFailure(db, { symptom: "s", cause: "c", lesson: "l", topic: "widget X" })
 check("failure id format", /^FAIL-\d{8}-[A-Z0-9]{8}$/.test(f.id), f.id)
-check("failure file exists", fs.existsSync(f.path))
+check("failure row stored in SQLite", (db.query("SELECT COUNT(*) AS n FROM work_items WHERE canonical_key=?").get(PM.normalizeKey(f.id)) as { n: number }).n === 1)
+check("failure persisted as done with lesson summary", (db.query("SELECT status, summary FROM work_items WHERE canonical_key=?").get(PM.normalizeKey(f.id)) as any).status === "done")
+check("no FAILURES.md created", !fs.existsSync(path.join(dir, ".opencode", "FAILURES.md")))
 r = PM.preflight(db, { task: "widget X", claim: false, ownerSession: "ses_D", projectDir: dir, fts })
 check("failure topic → COVERED", r.status === "COVERED", JSON.stringify(r))
+r = PM.preflight(db, { task: f.id, claim: false, ownerSession: "ses_D", projectDir: dir, fts })
+check("failure FAIL-ID → COVERED", r.status === "COVERED" && r.established.includes("l"), JSON.stringify(r))
 
 // 7. bootstrap indexes markdown only — never imports or rewrites work_items
 const b1 = PM.bootstrap(db, dir, fts)
@@ -83,7 +87,7 @@ check("FTS candidate → PARTIAL", r.status === "PARTIAL", JSON.stringify(r))
 // 10. concurrent failure ids all unique (collision-safe)
 const ids12: string[] = []
 await Promise.all(Array.from({ length: 20 }, async (_, i) => {
-  const f12 = PM.appendFailure(db, { projectDir: dir, symptom: `s${i}`, cause: `c${i}`, lesson: `l${i}`, fts })
+  const f12 = PM.recordFailure(db, { symptom: `s${i}`, cause: `c${i}`, lesson: `l${i}` })
   ids12.push(f12.id)
 }))
 check("concurrent failure ids unique", new Set(ids12).size === ids12.length, ids12.join(" "))
@@ -101,12 +105,12 @@ PM.maybeSyncFts(db13, fts13)
 const n13 = (db13.query("SELECT COUNT(*) AS n FROM memory_fts WHERE canonical_key='widget beta'").get() as { n: number }).n
 check("fts staleness race: same-ms insert synced", n13 === 1, `count=${n13}`)
 
-// 12: failure append authorization matrix
+// 12: failure record authorization matrix
 {
   const primaries = ["orchestrator", "orchestrator-goal"]
   check("auth orchestrator can append failures", PM.canAppendFailure("orchestrator", primaries) === true)
   check("auth orchestrator-goal can append failures", PM.canAppendFailure("orchestrator-goal", primaries) === true)
-  check("auth subagent cannot append failures", PM.canAppendFailure("subagent", primaries) === false)
+  check("auth subagent can append failures", PM.canAppendFailure("subagent", primaries) === true)
   check("auth verifier cannot append failures", PM.canAppendFailure("verifier", primaries) === false)
   check("auth vision cannot append failures", PM.canAppendFailure("vision", primaries) === false)
   check("auth unknown agent cannot append failures", PM.canAppendFailure("", primaries) === false)

@@ -70,7 +70,7 @@ export default {
           },
         }),
         project_failure_save: tool({
-          description: "Save a stable or reproducible failure only when it has an actionable lesson likely to prevent meaningful repeated work. Ordinary failed attempts belong in the work result.",
+          description: "Save a stable or reproducible failure only when it has an actionable lesson likely to prevent repeated meaningful work. Ordinary failed attempts belong in the work result. Persisted in SQLite (canonical operational memory); available to primary agents and subagent.",
           args: {
             symptom: tool.schema.string().describe("What failed"),
             cause: tool.schema.string().describe("Known cause, or unknown"),
@@ -79,13 +79,13 @@ export default {
           },
           execute: async (args: any, tctx: any) => {
             if (!handle) return JSON.stringify({ ok: false, error: "project memory unavailable" })
-            if (!PM.canAppendFailure(tctx.agent ?? "", PRIMARY_AGENTS)) return JSON.stringify({ ok: false, error: "agent is not allowed to append project failures" })
+            if (!PM.canAppendFailure(tctx.agent ?? "", PRIMARY_AGENTS)) return JSON.stringify({ ok: false, error: "agent is not allowed to record project failures" })
             try {
-              const res = PM.appendFailure(handle.db, { projectDir: directory, ...args, fts })
+              const res = PM.recordFailure(handle.db, args)
               PM.syncAllFts(handle.db, fts)
               return JSON.stringify({ ok: true, ...res })
             } catch (e: any) {
-              return JSON.stringify({ ok: false, error: `failure append failed: ${e?.message ?? e}` })
+              return JSON.stringify({ ok: false, error: `failure record failed: ${e?.message ?? e}` })
             }
           },
         }),

@@ -5,8 +5,11 @@ import * as path from "node:path"
 import * as crypto from "node:crypto"
 
 // ---------- authorization ----------
+// project_failure_save is available to the configured primary agents and to
+// `subagent` (which reports reusable failures to the orchestrator). verifier,
+// vision and any unrelated agent remain denied.
 export function canAppendFailure(agent: string, primaryAgents: string[]): boolean {
-  return primaryAgents.includes(agent)
+  return primaryAgents.includes(agent) || agent === "subagent"
 }
 
 // ---------- ULID (Crockford base32: 48-bit timestamp + 80-bit randomness) ----------
@@ -459,17 +462,19 @@ export function preflightCore(db: Database, opts: { task: string; claim: boolean
 // ---------- record ----------
 // facts is deliberately not part of this API: it was written but never
 // retrieved. The legacy facts table remains in the schema for compatibility.
-// Ownership: an in_progress ticket may only be updated/finished by the session
-// that holds it. Only the current owner may record on it (reclaim first via
-// project_work_check reclaim_ticket/reclaim_owner to take it over). Reclaim CAS
-// is untouched: after a successful reclaim the new owner matches the row and may
-// record. Terminal/claimable rows (done/blocked/covered/failed/new) carry no
-// ownership gate — only in_progress enforces it.
+// Ownership: a ticket may only be recorded by the session that owns it — even
+// after it reached a terminal/claimable status (done/blocked/failed/covered/new).
+// This prevents a stale pre-reclaim owner from overwriting the result recorded
+// by the new owner after a reclaim. Rule: owner_session set + caller != owner
+// => reject; matching owner => allow; legacy rows with no owner remain writable
+// by any caller (compatibility). Reclaim CAS is untouched: after a successful
+// reclaim via project_work_check reclaim_ticket/reclaim_owner the new owner
+// matches the row and may record.
 export function recordResult(db: Database, opts: { ticket: string; status: string; summary?: string; unresolved?: string; evidence?: string[]; ownerSession?: string }): { ok: true; item: WorkItem } | { ok: false; reason: string } {
   const item = db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem | undefined
   if (!item) return { ok: false, reason: `ticket not found: ${opts.ticket}` }
-  if (item.status === "in_progress" && item.owner_session && item.owner_session !== opts.ownerSession) {
-    return { ok: false, reason: `ticket ${opts.ticket} is in_progress and owned by ${item.owner_session}; session ${opts.ownerSession ?? "unknown"} cannot record it (reclaim via project_work_check with reclaim_ticket=${opts.ticket} and reclaim_owner=${item.owner_session})` }
+  if (item.owner_session && item.owner_session !== opts.ownerSession) {
+    return { ok: false, reason: `ticket ${opts.ticket} is owned by ${item.owner_session} (status=${item.status}); session ${opts.ownerSession ?? "unknown"} cannot record it (reclaim via project_work_check with reclaim_ticket=${opts.ticket} and reclaim_owner=${item.owner_session})` }
   }
   const now = nowIso()
   const status = ["done", "blocked", "failed"].includes(opts.status) ? opts.status : "done"
@@ -481,25 +486,25 @@ export function recordResult(db: Database, opts: { ticket: string; status: strin
   return { ok: true, item: db.query("SELECT * FROM work_items WHERE id=?").get(opts.ticket) as WorkItem }
 }
 
-// ---------- failure append (serialized writer, collision-safe id) ----------
-export function appendFailure(db: Database, opts: { projectDir: string; symptom: string; cause: string; lesson: string; topic?: string; fts: boolean }): { id: string; path: string } {
+// ---------- failure record (SQLite-only; serialized writer, collision-safe id) ----------
+// SQLite is the canonical operational memory: failures are persisted as done
+// work items keyed by a FAIL-YYYYMMDD-<id> identifier. No FAILURES.md dual-write
+// is performed — historical Markdown files are never created or modified here
+// (bootstrap() may still index an existing one for read_first as legacy
+// documentation only). No fake file evidence is created for a file that is no
+// longer written; the topic alias stays for retrieval.
+export function recordFailure(db: Database, opts: { symptom: string; cause: string; lesson: string; topic?: string }): { id: string } {
   const d = new Date()
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`
   const id = `FAIL-${ymd}-${ulid().slice(-8)}`
-  const dir = path.join(opts.projectDir, ".opencode")
-  fs.mkdirSync(dir, { recursive: true })
-  const file = path.join(dir, "FAILURES.md")
-  const block = `\n## ${id} — ${new Date().toISOString()}\n- **Sintomo**: ${opts.symptom}\n- **Causa**: ${opts.cause}\n- **Lezione**: ${opts.lesson}\n`
-  fs.appendFileSync(file, block, "utf8")
   const key = normalizeKey(id)
   const c = claimWorkItem(db, { canonicalKey: key, summary: opts.lesson, unresolved: "", notes: `symptom: ${opts.symptom}; cause: ${opts.cause}`, ownerSession: "system", source: "agent" })
   const item = c.ok ? c.item : c.inProgress
   db.run("UPDATE work_items SET status='done', summary=?, notes=?, updated_at=? WHERE id=?", [opts.lesson, `symptom: ${opts.symptom}; cause: ${opts.cause}`, nowIso(), item.id])
-  db.run("INSERT INTO evidence (work_item_id, path, kind, note) VALUES (?,?,?,?)", [item.id, file, "failures", id])
   if (opts.topic) {
     db.run("INSERT INTO aliases (work_item_id, alias) VALUES (?,?) ON CONFLICT(alias) DO NOTHING", [item.id, normalizeKey(opts.topic)])
   }
-  return { id, path: file }
+  return { id }
 }
 
 // ---------- bootstrap (Markdown index for read_first ONLY) ----------

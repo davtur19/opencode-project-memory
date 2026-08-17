@@ -283,14 +283,17 @@ export function ideaRecord(db: Database, opts: IdeaRecordOpts = {}): IdeaRecordR
   }
   const sameCall: SameCallTargets = { ideaId, ideaKey: key, condIds }
 
-  // 4. satisfies: only from a validated idea with evidence, against an EXISTING
-  //    condition, recording the idea id as provenance
+  // 4. satisfies: only from a validated idea with evidence, against a condition
+  //    that already exists OR is explicitly declared in this same call (via
+  //    `conditions`), recording the idea id as provenance. Unknown conditions
+  //    that are neither in the DB nor declared in the call are a validation
+  //    error — never an implicit placeholder.
   const satisfiesSpecs: string[] = []
   for (const s of opts.satisfies ?? []) {
     const skey = normalizeKey(typeof s === "string" ? s : "")
     if (!skey) { errors.push(`satisfies key required (got ${JSON.stringify(s)})`); continue }
     const cond = db.query("SELECT * FROM conditions WHERE canonical_key=?").get(skey) as ConditionRow | undefined
-    if (!cond) { errors.push(`satisfies target condition not found: ${skey}`); continue }
+    if (!cond && !condIds.has(skey)) { errors.push(`satisfies target condition not found: ${skey}`); continue }
     satisfiesSpecs.push(skey)
   }
   if (opts.satisfies?.length) {
